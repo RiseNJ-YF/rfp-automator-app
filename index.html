@@ -1757,9 +1757,10 @@ function BriefSection({
     })
   }))), /*#__PURE__*/React.createElement(Field, {
     label: "Address to / client contact"
-  }, /*#__PURE__*/React.createElement("input", {
-    className: inputCls,
-    placeholder: "John Doe, Owner LLC",
+  }, /*#__PURE__*/React.createElement("textarea", {
+    className: areaCls,
+    rows: 3,
+    placeholder: 'John Doe\nOwner LLC\n123 Main St, Lakewood, NJ',
     value: active.clientContact,
     onChange: e => patch({
       clientContact: e.target.value
