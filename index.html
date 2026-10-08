@@ -697,32 +697,33 @@ function gmailHeaders(id, names) {
 }
 // Latest message from `email` received after `afterMs` (any thread), plus whether any of them has an attachment.
 // Latest reply about this RFP: from the consultant, a colleague at their firm (when about this project), or anyone in the RFP thread.
-function findReply(email, afterMs, threadId, keys) {
+function findReply(email, afterMs, ctx) {
+  ctx = ctx || {};
   email = String(email || '').toLowerCase();
   var dom = email.split('@')[1] || '', firm = dom && !PUBLIC_MAIL.test(dom);
   var after = ' after:' + Math.floor((afterMs || 0) / 1000);
-  var base = 'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10&q=';
-  var own = {}, other = {};
-  var list = function (q, into) { return gfetch(base + encodeURIComponent(q)).then(function (r) { (r.messages || []).forEach(function (m) { into[m.id] = 1; }); }); };
-  var jobs = [list('from:(' + email + ')' + after, own)];
-  if (firm) jobs.push(list('from:(' + dom + ') -from:(' + email + ')' + after, other).catch(function () {}));
-  if (threadId) jobs.push(gfetch('https://gmail.googleapis.com/gmail/v1/users/me/threads/' + threadId + '?format=minimal').then(function (t) {
-    (t.messages || []).forEach(function (m) { if ((m.labelIds || []).indexOf('SENT') < 0 && Number(m.internalDate) >= (afterMs || 0) && !own[m.id]) other[m.id] = 'thread'; });
+  var base = 'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=15&q=';
+  var ids = {};
+  var list = function (q) { return gfetch(base + encodeURIComponent(q)).then(function (r) { (r.messages || []).forEach(function (m) { ids[m.id] = 1; }); }); };
+  var jobs = [list('from:(' + email + ')' + after)];
+  if (firm) jobs.push(list('from:(' + dom + ') -from:(' + email + ')' + after).catch(function () {}));
+  if (ctx.threadId) jobs.push(gfetch('https://gmail.googleapis.com/gmail/v1/users/me/threads/' + ctx.threadId + '?format=minimal').then(function (t) {
+    (t.messages || []).forEach(function (m) { if ((m.labelIds || []).indexOf('SENT') < 0 && Number(m.internalDate) >= (afterMs || 0)) ids[m.id] = 1; });
   }).catch(function () {}));
-  keys = (keys || []).map(function (k) { return String(k || '').trim().toLowerCase(); }).filter(function (k) { return k.length >= 3; });
   return Promise.all(jobs).then(function () {
-    var ids = Object.keys(own).concat(Object.keys(other).filter(function (i) { return !own[i]; })).slice(0, 12);
-    if (!ids.length) return null;
-    return Promise.all(ids.map(function (id) { return gmailHeaders(id, ['Subject', 'From']).catch(function () { return null; }); })).then(function (ms) {
-      ms = ms.filter(function (m) {
-        if (!m || m.labelIds.indexOf('SENT') >= 0) return false;
-        if (own[m.id] || other[m.id] === 'thread' || (threadId && m.threadId === threadId)) return true;
-        var subj = String(m.headers.subject || '').toLowerCase() + ' ' + String(m.snippet || '').toLowerCase();
-        return keys.some(function (k) { return subj.indexOf(k) >= 0; });
-      }).sort(function (x, y) { return y.internalDate - x.internalDate; });
+    var all = Object.keys(ids).slice(0, 20);
+    if (!all.length) return null;
+    return Promise.all(all.map(function (id) { return gmailHeaders(id, ['Subject', 'From']).catch(function () { return null; }); })).then(function (ms) {
+      // only messages about THIS project — not the consultant's other RFPs
+      var fromAddr = function (m) { var f = String(m.headers.from || ''); return ((f.match(/<([^>]+)>/) || [])[1] || f).trim().toLowerCase(); };
+      ms = ms.filter(function (m) { return m && m.labelIds.indexOf('SENT') < 0 && belongsTo({ threadId: m.threadId, subject: m.headers.subject || '', snippet: m.snippet, fromConsultant: fromAddr(m) === email }, ctx); })
+        .sort(function (x, y) { return y.internalDate - x.internalDate; });
       if (!ms.length) return null;
       var m = ms[0];
-      return gfetch(base + encodeURIComponent('from:(' + (firm ? email + ' OR ' + dom : email) + ')' + after + ' has:attachment')).then(function (a) { return (a.messages || []).length > 0; }).catch(function () { return false; }).then(function (att) {
+      return gfetch(base + encodeURIComponent('from:(' + (firm ? email + ' OR ' + dom : email) + ')' + after + ' has:attachment')).then(function (a) {
+        var withAtt = {}; (a.messages || []).forEach(function (x) { withAtt[x.id] = 1; });
+        return ms.some(function (x) { return withAtt[x.id]; });
+      }).catch(function () { return false; }).then(function (att) {
         var from = String(m.headers.from || '');
         return { messageId: m.id, threadId: m.threadId, at: m.internalDate || Date.now(), subject: m.headers.subject || '', snippet: m.snippet, hasAttachment: att, count: ms.length,
           from: ((from.match(/<([^>]+)>/) || [])[1] || from).trim().toLowerCase() === email ? '' : from.replace(/\s*<[^>]+>/, '').replace(/"/g, '') };
@@ -782,29 +783,52 @@ function gmailAttachment(msgId, attId) {
 // Replies about this RFP since `afterMs`, newest first (max 8): from the consultant, from colleagues at
 // the same company domain, and anything others posted in the original thread.
 var PUBLIC_MAIL = /^(gmail|googlemail|yahoo|ymail|hotmail|outlook|live|msn|aol|icloud|me|mac|comcast|verizon|att|optonline|protonmail)\./i;
-function collectReplies(email, afterMs, threadId, keys) {
+// Which project does a consultant's message belong to?
+//   ctx = { threadId, keys: [project number, name], others: [{ threadId, keys }] }  (others = the consultant's other RFPs)
+function projectKeys(keys) {
+  var out = [];
+  (keys || []).forEach(function (k) {
+    k = String(k || '').trim().toLowerCase(); if (k.length < 3) return;
+    out.push(k);
+    var digits = k.replace(/[^0-9a-z]/g, '');
+    if (/\d/.test(k) && digits.length >= 4 && digits !== k) out.push(digits); // "24-082" also matches "24082"
+  });
+  return out;
+}
+function mentions(text, keys) {
+  var t = String(text || '').toLowerCase(), flat = t.replace(/[^0-9a-z]/g, '');
+  return keys.some(function (k) { return /^[0-9a-z]+$/.test(k) && /\d/.test(k) ? flat.indexOf(k) >= 0 || t.indexOf(k) >= 0 : t.indexOf(k) >= 0; });
+}
+function belongsTo(m, ctx) {
+  ctx = ctx || {};
+  var mineKeys = projectKeys(ctx.keys), others = (ctx.others || []).map(function (o) { return { threadId: o.threadId, keys: projectKeys(o.keys) }; });
+  if (ctx.threadId && m.threadId === ctx.threadId) return true;                                   // reply in this RFP's thread
+  if (others.some(function (o) { return o.threadId && m.threadId === o.threadId; })) return false;  // reply in another RFP's thread
+  var subj = m.subject || '', all = subj + '\n' + (m.text || m.snippet || '') + '\n' + (m.files || []).join(' ');
+  var me = mentions(all, mineKeys), other = others.some(function (o) { return mentions(all, o.keys); });
+  if (me && !other) return true;
+  if (me && other) return mentions(subj, mineKeys) && !others.some(function (o) { return mentions(subj, o.keys); }); // both named: the subject decides
+  if (other) return false;
+  return !others.length && !!m.fromConsultant; // names no project: only from the consultant themself, and only when it's their only RFP
+}
+function collectReplies(email, afterMs, ctx) {
+  ctx = ctx || {};
   email = String(email || '').toLowerCase();
   var dom = email.split('@')[1] || '';
   var firm = dom && !PUBLIC_MAIL.test(dom);
-  var after = ' after:' + Math.floor((afterMs || 0) / 1000), base = 'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8&q=';
+  var after = ' after:' + Math.floor((afterMs || 0) / 1000), base = 'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=15&q=';
   var ids = {};
   var add = function (q) { return gfetch(base + encodeURIComponent(q)).then(function (r) { (r.messages || []).forEach(function (m) { ids[m.id] = 1; }); }).catch(function () {}); };
   var jobs = [add('from:(' + email + ')' + after)];
   if (firm) jobs.push(add('from:(' + dom + ') -from:(' + email + ')' + after));
-  if (threadId) jobs.push(gfetch('https://gmail.googleapis.com/gmail/v1/users/me/threads/' + threadId + '?format=minimal').then(function (t) {
+  if (ctx.threadId) jobs.push(gfetch('https://gmail.googleapis.com/gmail/v1/users/me/threads/' + ctx.threadId + '?format=minimal').then(function (t) {
     (t.messages || []).forEach(function (m) { if ((m.labelIds || []).indexOf('SENT') < 0 && Number(m.internalDate) >= (afterMs || 0)) ids[m.id] = 1; });
   }).catch(function () {}));
-  // only messages about this project: same thread, or the project number/name mentioned
-  keys = (keys || []).map(function (k) { return String(k || '').trim().toLowerCase(); }).filter(function (k) { return k.length >= 3; });
-  var about = function (r) { var t = (r.subject + '\n' + r.text).toLowerCase(); return (threadId && r.threadId === threadId) || keys.some(function (k) { return t.indexOf(k) >= 0; }); };
   return Promise.all(jobs).then(function () {
-    return Promise.all(Object.keys(ids).slice(0, 12).map(function (id) { return gmailMessageFull(id).catch(function () { return null; }); }));
+    return Promise.all(Object.keys(ids).slice(0, 20).map(function (id) { return gmailMessageFull(id).catch(function () { return null; }); }));
   }).then(function (list) {
-    list = list.filter(Boolean);
-    var own = list.filter(function (r) { return r.fromEmail === email; }), others = list.filter(function (r) { return r.fromEmail !== email; });
-    var ownAbout = own.filter(about);
-    var keep = (ownAbout.length || !keys.length ? ownAbout.length ? ownAbout : own : own).concat(others.filter(about));
-    return keep.sort(function (x, y) { return y.internalDate - x.internalDate; }).slice(0, 8);
+    return list.filter(function (r) { return r && belongsTo({ threadId: r.threadId, subject: r.subject, text: r.text, files: r.attachments.map(function (a) { return a.filename; }), fromConsultant: r.fromEmail === email }, ctx); })
+      .sort(function (x, y) { return y.internalDate - x.internalDate; }).slice(0, 8);
   });
 }
 
@@ -1153,7 +1177,7 @@ if (typeof module !== 'undefined') module.exports = {
   textToHtml: textToHtml, fmtAddr: fmtAddr, findFees: findFees, bestFee: bestFee, stripQuoted: stripQuoted, encHeader: encHeader, b64url: b64url, splitAddrs: splitAddrs,
   DEFAULT_BODY: DEFAULT_BODY, DEFAULT_SUBJECT: DEFAULT_SUBJECT,
   merge3: merge3, wsMergeList: wsMergeList, wsEncodeRow: wsEncodeRow, wsDecodeRows: wsDecodeRows, dedupeRoster: dedupeRoster,
-  pickGeminiModel: pickGeminiModel, geminiErrorKind: geminiErrorKind, geminiFallbacks: geminiFallbacks, sheetIdFromLink: sheetIdFromLink,
+  belongsTo: belongsTo, pickGeminiModel: pickGeminiModel, geminiErrorKind: geminiErrorKind, geminiFallbacks: geminiFallbacks, sheetIdFromLink: sheetIdFromLink,
 };
 
 /* ============================================================
@@ -2244,6 +2268,16 @@ function App() {
   const fromName = fromEntry && fromEntry.name || settings.senderName || google.name || '';
   const fromEmail = fromEntry && fromEntry.email || google.email;
 
+  // Which emails belong to this project: its own thread and number/name, but not the consultant's other RFPs.
+  const replyCtx = (p, cid) => ({
+    threadId: ((p.sentLog || {})[cid] || {}).threadId || '',
+    keys: [p.projectNumber, p.projectName],
+    others: projectsRef.current.filter(o => o.id !== p.id && (o.sentLog || {})[cid]).map(o => ({
+      threadId: o.sentLog[cid].threadId || '',
+      keys: [o.projectNumber, o.projectName]
+    }))
+  });
+  const MATCH_V = 2; // bump when the matching rules change, so old results get re-checked
   // Look in Gmail for replies from each consultant since the RFP went out.
   const checkReplies = async (projectIds, interactive) => {
     if (!tokenValid() || !hasScope(SCOPES.read)) {
@@ -2259,10 +2293,22 @@ function App() {
         const rows = projectRows(p, rosterRef.current, settings).filter(r => r.sent && r.sent.state === 'sent' && mine(r.sent) && !['awarded', 'notselected'].includes(r.status));
         for (const r of rows) {
           try {
-            const rep = await findReply(r.c.email, r.sent.at - 60000, r.sent.threadId, [p.projectNumber, p.projectName]);
-            if (rep && (!r.t.lastReply || r.t.lastReply.messageId !== rep.messageId || r.t.lastReply.count !== rep.count)) {
+            const rep = await findReply(r.c.email, r.sent.at - 60000, replyCtx(p, r.c.id));
+            const stale = r.t.matchV !== MATCH_V;
+            if (!rep && (r.t.lastReply || stale)) {
+              // nothing for THIS project (an earlier check may have picked up another project's email) — undo that
+              const fix = {
+                lastReply: undefined,
+                matchV: MATCH_V
+              };
+              if (r.t.lastReply) fix.extract = undefined;
+              updateTrackingFor(pid, r.c.id, fix);
+              continue;
+            }
+            if (rep && (stale || !r.t.lastReply || r.t.lastReply.messageId !== rep.messageId || r.t.lastReply.count !== rep.count)) {
               updateTrackingFor(pid, r.c.id, Object.assign({
-                lastReply: rep
+                lastReply: rep,
+                matchV: MATCH_V
               }, r.t.status === 'sent' ? {
                 status: undefined
               } : {}));
@@ -2303,7 +2349,7 @@ function App() {
       [key]: true
     }));
     try {
-      const replies = await collectReplies(c.email, sent.at - 60000, sent.threadId, [p.projectNumber, p.projectName]);
+      const replies = await collectReplies(c.email, sent.at - 60000, replyCtx(p, cid));
       if (!replies.length) {
         if (interactive) say('There\'s no reply from ' + (c.name || c.email) + ' in your Gmail yet.', 'Nothing to read');
         return;
