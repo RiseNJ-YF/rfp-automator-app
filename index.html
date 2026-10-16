@@ -1824,6 +1824,8 @@ function buildTrackingPdf(meta, rows) {
       }
       var caTxt = { included: 'Included', separate: 'Separate', hourly: 'Hourly', excluded: 'Not offered', unknown: '—' }[r.caMode] || '—';
       if (r.ca != null && (r.caMode === 'included' || r.caMode === 'separate')) caTxt += '\n' + $(r.ca);
+      if (r.caMode === 'hourly' && r.caRate) caTxt += '\n' + pdfSafe(r.caRate);
+      var inclTxt = r.caMode === 'hourly' ? (r.fee == null ? 'CA hourly' : $(r.fee) + '\n+ CA hourly') : $(r.incl);
       body.push([
         { content: pdfSafe(r.firm) + (r.people ? '\n' + pdfSafe(r.people) : ''), _firm: true },
         { content: pdfSafe(r.status), _status: r },
@@ -1832,8 +1834,8 @@ function buildTrackingPdf(meta, rows) {
         r.followUps ? String(r.followUps) : '—',
         r.fee == null ? '—' : $(r.fee),
         caTxt,
-        { content: $(r.excl), _low: r.lowExcl },
-        { content: $(r.incl), _low: r.lowIncl },
+        $(r.excl),
+        inclTxt,
         pdfSafe(r.notes || ''),
       ]);
     });
@@ -1850,12 +1852,11 @@ function buildTrackingPdf(meta, rows) {
         var raw = d.cell.raw || {};
         if (raw._firm) d.cell.styles.fontStyle = 'bold';
         if (raw._status) { d.cell.styles.fillColor = hexRgb(raw._status.statusBg === '#ffffff' ? '#f1f3f4' : raw._status.statusBg); d.cell.styles.textColor = hexRgb(raw._status.statusFg); d.cell.styles.fontStyle = 'bold'; }
-        if (raw._low) { d.cell.styles.textColor = [19, 115, 51]; d.cell.styles.fontStyle = 'bold'; }
       },
     });
     var after = doc.lastAutoTable.finalY + 10;
     doc.setFontSize(8); doc.setTextColor.apply(doc, muted); doc.setFont('helvetica', 'normal');
-    doc.text('Green = lowest in its discipline. "Design only" removes CA from fees that include it; "Total incl. CA" adds separately priced CA. Hourly or unoffered CA has no fixed total.', M, Math.min(after, H - 46));
+    doc.text('"Design only" removes CA from fees that include it; "Total incl. CA" adds separately priced CA. Where CA is hourly, the total is the fee plus CA billed hourly.', M, Math.min(after, H - 46));
 
     /* ---- proposal details ---- */
     var det = rows.filter(function (r) { return r.summary || (r.breakdown && r.breakdown.length) || r.exclusions || r.schedule || r.caNote; });
@@ -2500,21 +2501,6 @@ function App() {
     };
     rows.sort((a, b) => order(a.c.type) - order(b.c.type) || (a.c.firm || a.c.name || '').localeCompare(b.c.firm || b.c.name || ''));
     const parts = rows.map(r => feeParts(r.t));
-    const low = {};
-    rows.forEach((r, i) => {
-      const k = r.c.type || 'Other';
-      ['excl', 'incl'].forEach(f => {
-        const v = parts[i][f];
-        if (v != null) {
-          low[k + f] = low[k + f] || [];
-          low[k + f].push(v);
-        }
-      });
-    });
-    const isLow = (r, i, f) => {
-      const arr = low[(r.c.type || 'Other') + f] || [];
-      return arr.length > 1 && parts[i][f] === Math.min(...arr);
-    };
     const n = k => rows.filter(r => r.status === k).length;
     const data = rows.map((r, i) => {
       const multi = r.members.length > 1,
@@ -2544,8 +2530,7 @@ function App() {
           excluded: 'Not offered',
           unknown: ''
         }[r.t.caMode] + (fp.C != null && (r.t.caMode === 'included' || r.t.caMode === 'separate') ? ' (' + money(fp.C) + ')' : '') + ' — set by you' : ex.caNote || (fp.mode === 'hourly' ? fp.note : ''),
-        lowExcl: isLow(r, i, 'excl'),
-        lowIncl: isLow(r, i, 'incl'),
+        caRate: fp.mode === 'hourly' ? ((String(r.t.caFee || '') + ' ' + String(ex.caNote || '')).match(/\$\s*[\d,]+(?:\.\d+)?/) || [''])[0].replace(/\s+/g, '').replace(/^(.+)$/, '$1/hr') : '',
         notes: r.t.notes || '',
         summary: ex.summary || '',
         breakdown: ex.breakdown || [],
@@ -6299,7 +6284,14 @@ function TrackTable({
         value: r.t.fee || '',
         onChange: e => updateTracking(c.id, {
           fee: e.target.value
-        })
+        }),
+        onBlur: e => {
+          const s = e.target.value.trim(),
+            v = parseFee(s);
+          if (v != null && /^\$?\s*[\d,]+(\.\d+)?\s*[kKmM]?$/.test(s) && s !== money(v)) updateTracking(c.id, {
+            fee: money(v)
+          });
+        }
       });
       // a later reply proposes a different fee than the one you accepted
       const revised = r.t.fee && ex && ex.fee != null && ex.changedFrom != null && !r.t.newFeeDismissed && Math.abs((parseFee(r.t.fee) || 0) - ex.fee) > 0.5;
