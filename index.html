@@ -1858,31 +1858,6 @@ function buildTrackingPdf(meta, rows) {
     doc.setFontSize(8); doc.setTextColor.apply(doc, muted); doc.setFont('helvetica', 'normal');
     doc.text('"Design only" removes CA from fees that include it; "Total incl. CA" adds separately priced CA. Where CA is hourly, the total is the fee plus CA billed hourly.', M, Math.min(after, H - 46));
 
-    /* ---- proposal details ---- */
-    var det = rows.filter(function (r) { return r.summary || (r.breakdown && r.breakdown.length) || r.exclusions || r.schedule || r.caNote; });
-    if (det.length) {
-      doc.addPage();
-      doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.setTextColor.apply(doc, ink);
-      doc.text('Proposal details', M, M + 14);
-      var dbody = [];
-      det.forEach(function (r) {
-        var lines = [];
-        if (r.summary) lines.push(pdfSafe(r.summary));
-        if (r.breakdown && r.breakdown.length) lines.push(r.breakdown.map(function (b) { return pdfSafe(b.item) + ': ' + $(b.amount); }).join('   •   '));
-        if (r.caNote) lines.push('CA: ' + pdfSafe(r.caNote));
-        if (r.exclusions) lines.push('Exclusions: ' + pdfSafe(r.exclusions));
-        if (r.schedule) lines.push('Schedule: ' + pdfSafe(r.schedule));
-        dbody.push([{ content: pdfSafe(r.firm) + '\n' + pdfSafe(r.discipline), styles: { fontStyle: 'bold' } }, r.fee == null ? '—' : $(r.fee), lines.join('\n')]);
-      });
-      doc.autoTable({
-        startY: M + 26, margin: { left: M, right: M, bottom: 40 },
-        head: [['Consultant', 'Fee', 'From their proposal']], body: dbody, theme: 'grid',
-        styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 5, textColor: ink, lineColor: rule, lineWidth: 0.5, valign: 'top' },
-        headStyles: { fillColor: blue, textColor: 255, fontStyle: 'bold' },
-        columnStyles: { 0: { cellWidth: 150 }, 1: { cellWidth: 70, halign: 'right' }, 2: { cellWidth: 'auto' } },
-      });
-    }
-
     /* ---- footer on every page ---- */
     var n = doc.getNumberOfPages();
     for (var i = 1; i <= n; i++) {
