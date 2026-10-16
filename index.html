@@ -2518,7 +2518,7 @@ function App() {
     const n = k => rows.filter(r => r.status === k).length;
     const data = rows.map((r, i) => {
       const multi = r.members.length > 1,
-        ex = r.t.extract || {},
+        ex = r.t.feeDismissed ? {} : r.t.extract || {},
         fp = parts[i],
         sm = statusMeta(r.status);
       return {
@@ -3506,7 +3506,7 @@ function App() {
   const trackingRows = () => {
     const rows = [];
     projectsRef.current.filter(p => !isEmptyProject(p)).forEach(p => trackGroups(p, rosterRef.current, settingsRef.current).forEach(r => {
-      const ex = r.t.extract || {};
+      const ex = r.t.feeDismissed ? {} : r.t.extract || {};
       const fp = feeParts(r.t),
         num = v => v == null ? '' : v;
       const caBasis = {
@@ -5675,7 +5675,7 @@ function trackGroups(project, roster, settings) {
 }
 /* Fee with and without construction administration (CA), so proposals that price CA differently can be compared. */
 function feeParts(t) {
-  const ex = t.extract || {};
+  const ex = t.feeDismissed ? {} : t.extract || {}; // a suggestion you X'd out doesn't count anywhere
   const F = t.fee != null && t.fee !== '' ? parseFee(t.fee) : ex.fee != null ? ex.fee : null;
   const mode = t.caMode || ex.caMode || 'unknown';
   const C = t.caFee != null && t.caFee !== '' ? parseFee(t.caFee) : ex.ca != null ? ex.ca : null;
@@ -5834,7 +5834,7 @@ function CaCell({
   t,
   onChange
 }) {
-  const ex = t.extract || {};
+  const ex = t.feeDismissed ? {} : t.extract || {};
   const mode = t.caMode || ex.caMode || 'unknown';
   const amt = t.caFee != null ? t.caFee : ex.ca != null ? money(ex.ca) : '';
   const fp = feeParts(t);
