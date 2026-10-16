@@ -1747,6 +1747,153 @@ if (typeof module !== 'undefined') module.exports = {
   analyzeFee: analyzeFee, caInfo: caInfo, CA_RE: CA_RE, amountsIn: amountsIn, classifyLine: classifyLine, docxXmlToText: docxXmlToText, xlsxSheetToText: xlsxSheetToText, csvText: csvText,
   zipEntries: zipEntries, zipRead: zipRead, docxText: docxText, xlsxText: xlsxText, finishAiResult: finishAiResult, htmlTableText: htmlTableText, docKind: docKind, proposalLinks: proposalLinks, DECLINE_RE: DECLINE_RE,
 };
+
+/* ============================================================
+   RFP Automator — PDF report of a project's RFP tracking.
+   Vector title block and live text (no images), landscape letter.
+   jsPDF + AutoTable are loaded the first time a report is made.
+   ============================================================ */
+var PDF_CDN = {
+  jspdf: 'https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js',
+  table: 'https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js',
+};
+var _jspdf = null;
+function loadScriptOnce(src) {
+  return new Promise(function (resolve, reject) {
+    var s = document.createElement('script'); s.src = src;
+    s.onload = function () { resolve(); }; s.onerror = function () { reject(new Error('Could not load the PDF maker — check your internet connection.')); };
+    document.head.appendChild(s);
+  });
+}
+function loadJsPdf() {
+  if (window.jspdf && window.jspdf.jsPDF && window.jspdf.jsPDF.API.autoTable) return Promise.resolve(window.jspdf);
+  if (_jspdf) return _jspdf;
+  _jspdf = loadScriptOnce(PDF_CDN.jspdf).then(function () { return loadScriptOnce(PDF_CDN.table); }).then(function () { return window.jspdf; });
+  _jspdf.catch(function () { _jspdf = null; });
+  return _jspdf;
+}
+// The built-in PDF fonts only know Western characters.
+function pdfSafe(s) {
+  return String(s == null ? '' : s).replace(/[★✓✔]/g, '').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/…/g, '...')
+    .replace(/[^\x09\x0a\x0d\x20-\x7e -ÿ–—•]/g, '').trim();
+}
+function hexRgb(h) { h = String(h || '#000000').replace('#', ''); return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]; }
+
+/* meta: { projectNumber, projectName, client, preparedBy, firm, date, stats: [[label, value, color]] }
+   rows: [{ discipline, firm, people, status, statusBg, statusFg, sent, replies, lastReply, followUps,
+            fee, caMode, ca, excl, incl, caNote, notes, summary, breakdown:[{item, amount}], exclusions, schedule, lowExcl, lowIncl }] */
+function buildTrackingPdf(meta, rows) {
+  return loadJsPdf().then(function (lib) {
+    var doc = new lib.jsPDF({ orientation: 'landscape', unit: 'pt', format: 'letter' });
+    var W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight(), M = 36;
+    var blue = [11, 87, 208], ink = [31, 31, 31], muted = [95, 99, 104], rule = [225, 227, 225];
+    var $ = function (n) { return n == null || isNaN(n) ? '—' : '$' + Number(n).toLocaleString('en-US', { maximumFractionDigits: 0 }); };
+
+    /* ---- title block (vector shapes + live text) ---- */
+    doc.setFillColor.apply(doc, blue); doc.rect(M, M, 5, 46, 'F');
+    doc.setTextColor.apply(doc, ink); doc.setFont('helvetica', 'bold'); doc.setFontSize(19);
+    doc.text('RFP Tracking Report', M + 16, M + 18);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(11.5);
+    doc.text(pdfSafe((meta.projectNumber ? meta.projectNumber + '  ' : '') + (meta.projectName || 'Untitled project')), M + 16, M + 36);
+    if (meta.client) { doc.setFontSize(9); doc.setTextColor.apply(doc, muted); doc.text(pdfSafe(meta.client.split('\n')[0]), M + 16, M + 50); }
+    doc.setFontSize(9); doc.setTextColor.apply(doc, muted);
+    var rx = W - M;
+    if (meta.firm) { doc.setFont('helvetica', 'bold'); doc.setTextColor.apply(doc, ink); doc.setFontSize(11); doc.text(pdfSafe(meta.firm), rx, M + 14, { align: 'right' }); }
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor.apply(doc, muted);
+    doc.text(pdfSafe('Prepared ' + meta.date + (meta.preparedBy ? ' by ' + meta.preparedBy : '')), rx, M + 30, { align: 'right' });
+    doc.setDrawColor.apply(doc, rule); doc.setLineWidth(0.8); doc.line(M, M + 62, W - M, M + 62);
+
+    /* ---- summary tiles ---- */
+    var y = M + 78, tw = (W - 2 * M - 10 * (meta.stats.length - 1)) / meta.stats.length;
+    meta.stats.forEach(function (st, i) {
+      var x = M + i * (tw + 10);
+      doc.setFillColor(246, 248, 252); doc.roundedRect(x, y, tw, 44, 6, 6, 'F');
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor.apply(doc, hexRgb(st[2]));
+      doc.text(String(st[1]), x + 10, y + 21);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); doc.setTextColor.apply(doc, muted);
+      doc.text(pdfSafe(st[0]), x + 10, y + 36);
+    });
+    y += 60;
+
+    /* ---- main table, grouped by discipline ---- */
+    var body = [], lastDisc = null;
+    rows.forEach(function (r) {
+      if (r.discipline !== lastDisc) {
+        lastDisc = r.discipline;
+        body.push([{ content: pdfSafe(r.discipline || 'Other'), colSpan: 10, styles: { fillColor: [232, 240, 254], textColor: blue, fontStyle: 'bold', fontSize: 9 } }]);
+      }
+      var caTxt = { included: 'Included', separate: 'Separate', hourly: 'Hourly', excluded: 'Not offered', unknown: '—' }[r.caMode] || '—';
+      if (r.ca != null && (r.caMode === 'included' || r.caMode === 'separate')) caTxt += '\n' + $(r.ca);
+      body.push([
+        { content: pdfSafe(r.firm) + (r.people ? '\n' + pdfSafe(r.people) : ''), _firm: true },
+        { content: pdfSafe(r.status), _status: r },
+        pdfSafe(r.sent || '—'),
+        r.replies ? r.replies + (r.lastReply ? '\nlast ' + pdfSafe(r.lastReply) : '') : '—',
+        r.followUps ? String(r.followUps) : '—',
+        r.fee == null ? '—' : $(r.fee),
+        caTxt,
+        { content: $(r.excl), _low: r.lowExcl },
+        { content: $(r.incl), _low: r.lowIncl },
+        pdfSafe(r.notes || ''),
+      ]);
+    });
+    doc.autoTable({
+      startY: y, margin: { left: M, right: M, bottom: 40 },
+      head: [['Consultant', 'Status', 'Sent', 'Replies', 'Follow-\nups', 'Fee as proposed', 'CA', 'Design only (excl. CA)', 'Total incl. CA', 'Notes']],
+      body: body,
+      theme: 'grid',
+      styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 4, textColor: ink, lineColor: rule, lineWidth: 0.5, valign: 'middle' },
+      headStyles: { fillColor: blue, textColor: 255, fontStyle: 'bold', fontSize: 8.5 },
+      columnStyles: { 0: { cellWidth: 140 }, 1: { cellWidth: 74 }, 2: { cellWidth: 50 }, 3: { cellWidth: 58 }, 4: { cellWidth: 50, halign: 'center' }, 5: { cellWidth: 62, halign: 'right' }, 6: { cellWidth: 54 }, 7: { cellWidth: 66, halign: 'right' }, 8: { cellWidth: 62, halign: 'right' }, 9: { cellWidth: 'auto' } },
+      didParseCell: function (d) {
+        if (d.section !== 'body') return;
+        var raw = d.cell.raw || {};
+        if (raw._firm) d.cell.styles.fontStyle = 'bold';
+        if (raw._status) { d.cell.styles.fillColor = hexRgb(raw._status.statusBg === '#ffffff' ? '#f1f3f4' : raw._status.statusBg); d.cell.styles.textColor = hexRgb(raw._status.statusFg); d.cell.styles.fontStyle = 'bold'; }
+        if (raw._low) { d.cell.styles.textColor = [19, 115, 51]; d.cell.styles.fontStyle = 'bold'; }
+      },
+    });
+    var after = doc.lastAutoTable.finalY + 10;
+    doc.setFontSize(8); doc.setTextColor.apply(doc, muted); doc.setFont('helvetica', 'normal');
+    doc.text('Green = lowest in its discipline. "Design only" removes CA from fees that include it; "Total incl. CA" adds separately priced CA. Hourly or unoffered CA has no fixed total.', M, Math.min(after, H - 46));
+
+    /* ---- proposal details ---- */
+    var det = rows.filter(function (r) { return r.summary || (r.breakdown && r.breakdown.length) || r.exclusions || r.schedule || r.caNote; });
+    if (det.length) {
+      doc.addPage();
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.setTextColor.apply(doc, ink);
+      doc.text('Proposal details', M, M + 14);
+      var dbody = [];
+      det.forEach(function (r) {
+        var lines = [];
+        if (r.summary) lines.push(pdfSafe(r.summary));
+        if (r.breakdown && r.breakdown.length) lines.push(r.breakdown.map(function (b) { return pdfSafe(b.item) + ': ' + $(b.amount); }).join('   •   '));
+        if (r.caNote) lines.push('CA: ' + pdfSafe(r.caNote));
+        if (r.exclusions) lines.push('Exclusions: ' + pdfSafe(r.exclusions));
+        if (r.schedule) lines.push('Schedule: ' + pdfSafe(r.schedule));
+        dbody.push([{ content: pdfSafe(r.firm) + '\n' + pdfSafe(r.discipline), styles: { fontStyle: 'bold' } }, r.fee == null ? '—' : $(r.fee), lines.join('\n')]);
+      });
+      doc.autoTable({
+        startY: M + 26, margin: { left: M, right: M, bottom: 40 },
+        head: [['Consultant', 'Fee', 'From their proposal']], body: dbody, theme: 'grid',
+        styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 5, textColor: ink, lineColor: rule, lineWidth: 0.5, valign: 'top' },
+        headStyles: { fillColor: blue, textColor: 255, fontStyle: 'bold' },
+        columnStyles: { 0: { cellWidth: 150 }, 1: { cellWidth: 70, halign: 'right' }, 2: { cellWidth: 'auto' } },
+      });
+    }
+
+    /* ---- footer on every page ---- */
+    var n = doc.getNumberOfPages();
+    for (var i = 1; i <= n; i++) {
+      doc.setPage(i);
+      doc.setDrawColor.apply(doc, rule); doc.line(M, H - 28, W - M, H - 28);
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor.apply(doc, muted);
+      doc.text(pdfSafe((meta.projectNumber ? meta.projectNumber + ' ' : '') + (meta.projectName || '') + ' — RFP tracking — ' + meta.date), M, H - 16);
+      doc.text('Page ' + i + ' of ' + n, W - M, H - 16, { align: 'right' });
+    }
+    return doc;
+  });
+}
 </script>
 <script>const {
   useState,
@@ -2339,6 +2486,97 @@ function App() {
       tracking: tr
     };
   });
+  // PDF report of one project's RFP tracking: statuses, replies, follow-ups and fees (with and without CA)
+  const [reportBusy, setReportBusy] = useState(false);
+  const exportReport = async project => {
+    const rows = trackGroups(project, rosterRef.current, settingsRef.current);
+    if (!rows.length) {
+      say('Nothing to report yet — send the RFP first.', 'No tracking yet');
+      return;
+    }
+    const order = t => {
+      const i = (settingsRef.current.disciplines || []).indexOf(t);
+      return i < 0 ? 999 : i;
+    };
+    rows.sort((a, b) => order(a.c.type) - order(b.c.type) || (a.c.firm || a.c.name || '').localeCompare(b.c.firm || b.c.name || ''));
+    const parts = rows.map(r => feeParts(r.t));
+    const low = {};
+    rows.forEach((r, i) => {
+      const k = r.c.type || 'Other';
+      ['excl', 'incl'].forEach(f => {
+        const v = parts[i][f];
+        if (v != null) {
+          low[k + f] = low[k + f] || [];
+          low[k + f].push(v);
+        }
+      });
+    });
+    const isLow = (r, i, f) => {
+      const arr = low[(r.c.type || 'Other') + f] || [];
+      return arr.length > 1 && parts[i][f] === Math.min(...arr);
+    };
+    const n = k => rows.filter(r => r.status === k).length;
+    const data = rows.map((r, i) => {
+      const multi = r.members.length > 1,
+        ex = r.t.extract || {},
+        fp = parts[i],
+        sm = statusMeta(r.status);
+      return {
+        discipline: r.c.type || 'Other',
+        firm: multi ? r.c.firm || mailDomain(r.c.email) : r.c.firm || r.c.name || r.c.email,
+        people: multi ? r.members.map(m => m.c.name || m.c.email).join(', ') : r.c.firm ? r.c.name || r.c.email : '',
+        status: sm.label,
+        statusBg: sm.bg,
+        statusFg: sm.fg,
+        sent: r.sent && r.sent.state === 'sent' ? shortDate(r.sent.at) + (r.sent.manual ? ' (outside app)' : '') : 'Not sent',
+        replies: r.replies.length,
+        lastReply: r.replies[0] ? shortDate(r.replies[0].at) : '',
+        followUps: r.followUps.length,
+        fee: fp.F,
+        caMode: fp.mode,
+        ca: fp.C,
+        excl: fp.excl,
+        incl: fp.incl,
+        caNote: r.t.caMode ? {
+          included: 'Included in the fee',
+          separate: 'Priced separately',
+          hourly: 'Hourly',
+          excluded: 'Not offered',
+          unknown: ''
+        }[r.t.caMode] + (fp.C != null && (r.t.caMode === 'included' || r.t.caMode === 'separate') ? ' (' + money(fp.C) + ')' : '') + ' — set by you' : ex.caNote || (fp.mode === 'hourly' ? fp.note : ''),
+        lowExcl: isLow(r, i, 'excl'),
+        lowIncl: isLow(r, i, 'incl'),
+        notes: r.t.notes || '',
+        summary: ex.summary || '',
+        breakdown: ex.breakdown || [],
+        exclusions: ex.exclusions || '',
+        schedule: ex.schedule || ''
+      };
+    });
+    const meta = {
+      projectNumber: project.projectNumber,
+      projectName: project.projectName,
+      client: project.clientContact,
+      firm: settingsRef.current.firmName || '',
+      preparedBy: google.name || google.email || '',
+      date: new Date().toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric'
+      }),
+      stats: [['Consultants', rows.length, '#1f1f1f'], ['Awaiting reply', n('sent'), '#0b57d0'], ['Replied', n('replied'), '#8430ce'], ['Proposals', n('proposal') + n('awarded') + n('notselected'), '#137333'], ['Declined', n('declined'), '#5f6368'], ['Follow up now', rows.filter(r => r.needsFollow).length, '#c5221f']]
+    };
+    setReportBusy(true);
+    try {
+      const doc = await buildTrackingPdf(meta, data);
+      const name = ('RFP Tracking - ' + (project.projectNumber ? project.projectNumber + ' ' : '') + (project.projectName || 'Project') + ' - ' + isoDate()).replace(/[\\/:*?"<>|]+/g, '-');
+      doc.save(name + '.pdf');
+    } catch (e) {
+      say(e.message || 'The PDF could not be made.', 'Report not created');
+    } finally {
+      setReportBusy(false);
+    }
+  };
   const trackActions = {
     setSentDate,
     logFollowUp,
@@ -3787,6 +4025,8 @@ function App() {
       row
     }),
     actions: trackActions,
+    onReport: () => exportReport(active),
+    reportBusy: reportBusy,
     updateTracking: updateTracking,
     onFollowUp: rows => setFuRows(rows),
     onCompose: () => setView('compose'),
@@ -5601,8 +5841,10 @@ function CaCell({
   const tip = fp.F != null ? 'Design only: ' + (fp.excl != null ? money(fp.excl) : '—') + ' · With CA: ' + (fp.incl != null ? money(fp.incl) : '—') + (fp.note ? ' (' + fp.note + ')' : '') : 'Enter the fee to compare with and without CA';
   const from = !t.caMode && ex.caMode && ex.caMode !== 'unknown';
   return /*#__PURE__*/React.createElement("div", {
-    className: "flex items-center gap-1 min-w-0",
+    className: "min-w-0",
     title: tip
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-1 min-w-0"
   }, /*#__PURE__*/React.createElement("select", {
     value: mode,
     onChange: e => onChange({
@@ -5632,7 +5874,11 @@ function CaCell({
         caFee: money(v)
       });
     }
-  }));
+  })), fp.F != null && mode === 'separate' && fp.incl != null && /*#__PURE__*/React.createElement("div", {
+    className: "text-[12px] pl-2 mt-0.5 whitespace-nowrap"
+  }, "Total ", /*#__PURE__*/React.createElement("b", null, money(fp.incl))), fp.F != null && mode === 'included' && fp.excl != null && /*#__PURE__*/React.createElement("div", {
+    className: "text-[11px] text-muted pl-2 mt-0.5 whitespace-nowrap"
+  }, "Design only ", money(fp.excl)));
 }
 function FeeSummary({
   ex,
@@ -6329,7 +6575,9 @@ function TrackingView({
   onRead,
   reading,
   onPerson,
-  actions
+  actions,
+  onReport,
+  reportBusy
 }) {
   const [compare, setCompare] = useState(false);
   const rows = trackGroups(project, roster, settings);
@@ -6378,6 +6626,14 @@ function TrackingView({
   }, /*#__PURE__*/React.createElement("span", {
     className: "text-[12px] text-muted"
   }, lastChecked ? 'Checked ' + daysAgo(lastChecked).replace('today', 'just now') : ''), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    disabled: reportBusy,
+    onClick: onReport,
+    title: "Download a PDF report of this project's RFP tracking — statuses and fees"
+  }, reportBusy ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Spinner, null), "Making PDF…") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Icon, {
+    name: "doc",
+    className: "w-[18px] h-[18px]"
+  }), "PDF report")), /*#__PURE__*/React.createElement(Btn, {
     kind: compare ? 'tonal' : 'ghost',
     onClick: () => setCompare(v => !v),
     title: "Compare fees side by side, with and without construction administration"
@@ -8389,6 +8645,16 @@ function SettingsModal({
     onChange: e => setS({
       ...s,
       fallbackSignature: e.target.value
+    })
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Firm name (shown on PDF reports)"
+  }, /*#__PURE__*/React.createElement("input", {
+    className: inputCls,
+    placeholder: "RISE Architecture",
+    value: s.firmName || '',
+    onChange: e => setS({
+      ...s,
+      firmName: e.target.value
     })
   })), /*#__PURE__*/React.createElement(Field, {
     label: "Your name (From display name if Gmail has none)"
