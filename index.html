@@ -1559,7 +1559,7 @@ function runSummingTo(items, target, from) {
 }
 
 // docs: [{ name, text, tabular, order }] newest first. Returns the best fee with its breakdown and checks.
-function analyzeFee(docs) {
+function analyzeFeeCore(docs) {
   var cands = [], optional = [], reimb = [], hourly = [], units = [], percent = [], caSeen = [], allText = '';
   var addU = function (arr, x) { if (!arr.some(function (y) { return y.amount === x.amount && y.item === x.item; }) && arr.length < 12) arr.push(x); };
   docs.forEach(function (doc, di) {
@@ -1781,6 +1781,172 @@ function caInfo(best, caSeen, text) {
   if (CA_EXCLUDED_RE.test(text || '')) return { caMode: 'excluded', ca: null, caNote: 'Proposal says CA is not included' };
   return { caMode: 'unknown', ca: null };
 }
+/* ---------- Several emails / attachments: which fee is the current one? ----------
+   docs arrive newest first; each email is followed by its own attachments. Every message is read on its
+   own, then the messages are walked oldest to newest the way a person would: a later fee replaces an
+   earlier one, unless it is clearly an extra (additional services) or a small partial amount. */
+var FEE_REVISE_RE = /\b(revis\w*|updated?|amended|reduc\w*|lower(ed|ing)?|discount\w*|sharpen\w*|supersed\w*|replac\w*|corrected|correction|adjust\w*|best and final|instead of|new (fee|price|number|proposal|total)|(bring|get|come) (it|the fee|our fee|that|the number|our number) (down|up)( to)?|can do (it|this|that|the (job|project|work)) for|would be willing to|meet you at)\b/i;
+var FEE_ADDON_RE = /\b(additional(ly)?|add[- ]?(on|ons|alternate|service|services)|added|adding|extra|in addition|on top of|plus an?|supplement\w*|change order|add'?l|separate (fee|proposal|line)|not included in (the|our) (fee|proposal)|if (you|needed|required|requested))\b/i;
+var FEE_ADDON_DOC_RE = /(additional[- ]services?|add(itional)?[- ]service|change order|supplement(al)? (proposal|fee|services?)|amendment\s*(no\.?|#)?\s*\d|add[- ]?on proposal)/i;
+var FEE_REVISED_DOC_RE = /\b(rev(ised|ision)?\.?\s*\d*|updated?|amended|final|v\d+|r\d+)\b/i;
+var FEE_DISCOUNT_RE = /\b(\d{1,2}(?:\.\d)?\s?%\s*(discount|reduction|off|less)|(discount|reduction|reduce\w*|lower\w*|take) (of |by |off )?(another )?\d{1,2}(?:\.\d)?\s?%)/i;
+function feeDocIsEmail(d) { return d.kind === 'email' || /^email\b/i.test(String(d.name || '')); }
+function feeDocWhen(name) { var m = String(name || '').match(/ of ([^,]+)$/); return m ? m[1] : ''; }
+function feeLinesWith(text, amount) {
+  var want = String(Math.round(amount)), lines = String(text || '').split('\n'), out = [];
+  lines.forEach(function (l, i) {
+    var nums = l.replace(/(\d)[,.](?=\d{3}\b)/g, '$1').match(/\d+(?:\.\d+)?/g) || [];
+    if (nums.some(function (n) { return String(Math.round(Number(n))) === want; })) out.push((lines[i - 1] || '') + ' ' + l);
+  });
+  return out.join(' ');
+}
+// "reduce our fee from $50,000 to $45,000" → 45000
+function feeFromTo(text) {
+  var m = String(text || '').replace(/\s+/g, ' ').match(/(?:from|was|were|of)\s+\$\s?([\d,]+(?:\.\d+)?)[^$]{0,60}?\b(?:to|down to|is now|now)\s+\$\s?([\d,]+(?:\.\d+)?)/i);
+  if (!m) return null;
+  var a = Number(m[1].replace(/,/g, '')), b = Number(m[2].replace(/,/g, ''));
+  return a >= 500 && b >= 500 && a !== b ? { was: a, now: b } : null;
+}
+// dollar figures in a short email that are not hourly rates, insurance, retainers or extras
+function feeLooseAmounts(text) {
+  var out = [];
+  String(text || '').split('\n').forEach(function (l) {
+    if (/per hour|\/\s?hr|hourly|insurance|retainer|deposit|per (visit|trip|sheet|unit)|each\b/i.test(l) || FEE_ADDON_RE.test(l)) return;
+    var re = /\$\s?(\d[\d,]*(?:\.\d+)?)\s?(k\b)?/gi, m;
+    while ((m = re.exec(l))) { var v = Number(m[1].replace(/,/g, '')) * (m[2] ? 1000 : 1); if (v >= 1000 && !out.some(function (x) { return x === v; })) out.push(v); }
+  });
+  return out;
+}
+function analyzeFee(docs) {
+  docs = (docs || []).filter(Boolean);
+  var whole = analyzeFeeCore(docs);
+  if (docs.length < 2) return whole;
+  // 1. group into messages (newest first)
+  var groups = [];
+  docs.forEach(function (d) {
+    if (feeDocIsEmail(d) || !groups.length) groups.push({ docs: [], when: feeDocWhen(d.name), email: feeDocIsEmail(d) ? d : null });
+    groups[groups.length - 1].docs.push(d);
+  });
+  var tag = function (src, g) { return src ? src + (g.when && src.indexOf(g.when) < 0 ? ', ' + g.when : '') : (g.when || 'reply'); };
+  // 2. read each message on its own
+  var extras = [], notes = [], discount = null;
+  groups.forEach(function (g, gi) {
+    g.gi = gi; g.units = []; g.text = g.email ? String(g.email.text || '') : '';
+    var main = [];
+    g.docs.forEach(function (d) {
+      var r = analyzeFeeCore([d]);
+      var head = String(d.name || '').replace(/[_\-.]+/g, ' ') + ' ' + String(d.text || '').slice(0, 400);
+      var u = { doc: d, r: r, fee: r.fee, email: feeDocIsEmail(d), revised: !feeDocIsEmail(d) && (FEE_REVISED_DOC_RE.test(String(d.name || '').replace(/\.[a-z0-9]+$/i, '').replace(/[_\-.]+/g, ' ')) || /revised|updated proposal|supersedes/i.test(String(d.text || '').slice(0, 300))) };
+      if (!u.email && FEE_ADDON_DOC_RE.test(head) && !/revised|supersedes/i.test(head)) { if (r.fee != null) extras.push({ amount: r.fee, source: tag(d.name, g), why: 'additional-services proposal' }); return; }
+      main.push(d); if (r.fee != null) g.units.push(u);
+    });
+    if (!g.units.length) {
+      if (!g.email) return;
+      if (!discount && FEE_DISCOUNT_RE.test(g.text)) discount = { gi: gi, text: (g.text.match(FEE_DISCOUNT_RE) || [''])[0], when: g.when };
+      g.opts = (analyzeFeeCore([g.email]).optional || []).map(function (o) { return o.amount; });
+      g.text.split('\n').forEach(function (l) {
+        if (!FEE_ADDON_RE.test(l) || /per hour|\/\s?hr|hourly/i.test(l)) return;
+        var re = /\$\s?(\d[\d,]*(?:\.\d+)?)\s?(k\b)?/gi, m;
+        while ((m = re.exec(l))) { var v = Number(m[1].replace(/,/g, '')) * (m[2] ? 1000 : 1); if (v >= 250 && !g.opts.some(function (o) { return near(o, v); })) g.opts.push(v); }
+      });
+      var loose = feeLooseAmounts(g.text).filter(function (v) { return !g.opts.some(function (o) { return near(o, v); }); });
+      if (loose.length === 1) g.loose = loose[0];
+      return;
+    }
+    g.r = analyzeFeeCore(main);
+    // two attachments in one message with different fees
+    var atts = g.units.filter(function (u) { return !u.email; });
+    var inPick = function (amt) { return near(amt, g.r.fee) || (g.r.breakdown || []).some(function (b) { return near(b.amount, amt); }); };
+    var differ = atts.filter(function (u) { return !inPick(u.fee); });
+    if (differ.length) {
+      var rev = atts.filter(function (u) { return u.revised; });
+      if (rev.length === 1) {
+        if (!near(rev[0].fee, g.r.fee)) g.r = rev[0].r;
+        g.older = atts.filter(function (u) { return u !== rev[0] && !near(u.fee, rev[0].fee); }).map(function (u) { return { amount: u.fee, source: tag(u.doc.name, g) }; });
+      } else {
+        g.conflict = atts.filter(function (u, i) { return atts.findIndex(function (v) { return near(v.fee, u.fee); }) === i; }).map(function (u) { return { amount: u.fee, source: u.doc.name }; });
+      }
+    }
+    g.fee = g.r.fee;
+    g.fromEmail = !!g.email && g.r.source === g.email.name;
+    // "from $50,000 to $45,000" inside one email
+    var ft = g.fromEmail ? feeFromTo(g.text) : null;
+    if (ft && !near(g.fee, ft.now)) { g.fee = ft.now; g.r = Object.assign({}, g.r, { fee: ft.now, statedTotal: ft.now, itemsTotal: null, check: 'stated', breakdown: [], feeText: 'revised fee', confidence: 'medium', summary: money(ft.now) + ' (revised from ' + money(ft.was) + ').', alternatives: [] }); g.was = ft.was; }
+    else if (ft) g.was = ft.was;
+    var ctx = g.fromEmail ? feeLinesWith(g.text, g.fee) : '';
+    g.revise = FEE_REVISE_RE.test(g.fromEmail ? g.text : '') || g.units.some(function (u) { return u.revised && near(u.fee, g.fee); }) || !!ft;
+    g.addon = g.fromEmail && FEE_ADDON_RE.test(ctx) && !FEE_REVISE_RE.test(ctx) && !ft;
+  });
+  // a short later email that only names a figure ("Final: we can do it for $42,000") counts when it is in the range of the fee before it
+  groups.slice().reverse().forEach(function (g) {
+    if (g.fee != null || g.loose == null) return;
+    var before = groups.filter(function (o) { return o.gi > g.gi && o.fee != null && !o.addon; })[0];
+    if (!before || g.loose < before.fee * 0.4 || g.loose > before.fee * 2.5 || near(g.loose, before.fee)) return;
+    var said = FEE_REVISE_RE.test(g.text);
+    g.fee = g.loose; g.fromEmail = true; g.revise = said; g.addon = false;
+    g.r = { fee: g.loose, feeType: 'lump sum', feeText: 'figure in a later email', statedTotal: g.loose, itemsTotal: null, check: 'stated', breakdown: [], optional: [], reimbursables: [], hourly: [], units: [], percent: [],
+      source: g.email.name, confidence: said ? 'medium' : 'low', alternatives: [], summary: money(g.loose) + ' (figure in a later email' + (said ? '' : ' — not clearly called the fee') + ').', caMode: 'unknown', ca: null };
+  });
+  var withFee = groups.filter(function (g) { return g.fee != null; });
+  if (!withFee.length) {
+    if (extras.length) whole.summary = (whole.summary ? whole.summary + ' ' : '') + 'Only an additional-services amount was found (' + extras.map(function (e) { return money(e.amount); }).join(', ') + ').';
+    return whole;
+  }
+  // 3. oldest → newest: a later fee replaces the earlier one unless it is an extra or a small partial amount
+  var cur = null, earlier = [], partial = [];
+  withFee.slice().reverse().forEach(function (g) {
+    if (!cur) { if (g.addon && withFee.length > 1 && g !== withFee[0]) { extras.push({ amount: g.fee, source: tag(g.r.source, g), why: 'described as additional' }); return; } cur = g; return; }
+    if (near(g.fee, cur.fee)) { var n = (cur.agrees || 0) + 1; if (g.r.check === 'match' || cur.r.check !== 'match') cur = g; cur.agrees = n; return; }
+    if (g.addon) { extras.push({ amount: g.fee, source: tag(g.r.source, g), why: 'described as additional' }); return; }
+    if (g.fee < cur.fee * 0.4 && !g.revise) { partial.push({ amount: g.fee, source: tag(g.r.source, g) }); return; }
+    earlier.push({ amount: cur.fee, source: tag(cur.r.source, cur) });
+    (cur.older || []).forEach(function (o) { earlier.push(o); });
+    cur = g;
+  });
+  (cur.older || []).forEach(function (o) { earlier.push(o); });
+  if (cur.was != null && !earlier.some(function (e) { return near(e.amount, cur.was); })) earlier.push({ amount: cur.was, source: 'same email' });
+  earlier = earlier.filter(function (e, i) { return !near(e.amount, cur.fee) && earlier.findIndex(function (x) { return near(x.amount, e.amount); }) === i; });
+  groups.forEach(function (g) { if (g.fee == null && g.gi < cur.gi) (g.opts || []).forEach(function (o) { extras.push({ amount: o, source: tag(g.email.name, g), why: 'described as additional' }); }); });
+  // 4. build the answer from the current message
+  var out = Object.assign({}, cur.r);
+  var multi = earlier.length || partial.length || extras.length || cur.conflict || (discount && discount.gi < cur.gi);
+  if (!multi) {
+    if (cur.agrees && out.confidence === 'medium' && out.check === 'stated') out.confidence = 'high';
+    return fillFromOlder(out, cur, withFee);
+  }
+  var lead = [];
+  if (earlier.length) lead.push('Newest fee used: ' + money(cur.fee) + ' (' + tag(out.source, cur) + '). Earlier: ' + earlier.map(function (e) { return money(e.amount) + ' (' + e.source + ')'; }).join(', ') + '.');
+  if (cur.conflict) lead.push('Attachments in the same email give different fees: ' + cur.conflict.map(function (c) { return money(c.amount) + ' (' + c.source + ')'; }).join(' and ') + ' — check which applies, or whether both do.');
+  if (partial.length) lead.push('A later message mentions ' + partial.map(function (e) { return money(e.amount) + ' (' + e.source + ')'; }).join(', ') + ' — far below the proposal, so it was read as a partial or extra amount, not a new fee. Check.');
+  if (extras.length) lead.push('Not included: ' + extras.map(function (e) { return money(e.amount) + ' ' + e.why + ' (' + e.source + ')'; }).join(', ') + '.');
+  if (discount && discount.gi < cur.gi) lead.push('A later email' + (discount.when ? ' (' + discount.when + ')' : '') + ' mentions "' + discount.text + '" without a new figure — the fee shown is before that.');
+  out.summary = lead.join(' ') + (out.summary ? ' ' + out.summary : '');
+  out.confidence = cur.conflict || (discount && discount.gi < cur.gi) ? 'low' : out.confidence === 'high' || (cur.revise && cur.fromEmail && out.fee >= 1000) ? 'medium' : out.confidence || 'low';
+  var alts = [];
+  var addAlt = function (amount, source, label) { if (!near(amount, out.fee) && !alts.some(function (a) { return near(a.amount, amount); }) && alts.length < 5) alts.push({ amount: amount, source: source, label: label }); };
+  (cur.conflict || []).forEach(function (c) { addAlt(c.amount, 'same email — ' + c.source, 'other attachment'); });
+  earlier.forEach(function (e) { addAlt(e.amount, 'earlier — ' + e.source, 'earlier fee'); });
+  partial.forEach(function (e) { addAlt(e.amount, 'later, partial? — ' + e.source, 'later amount'); });
+  extras.forEach(function (e) { addAlt(e.amount, 'additional — ' + e.source, 'additional'); });
+  (out.alternatives || []).forEach(function (a) { addAlt(a.amount, a.source, a.label); });
+  out.alternatives = alts;
+  out.multi = true;
+  out.versions = [{ amount: out.fee, source: tag(out.source, cur), role: 'current' }].concat(earlier.map(function (e) { return { amount: e.amount, source: e.source, role: 'earlier' }; }), partial.map(function (e) { return { amount: e.amount, source: e.source, role: 'partial' }; }), extras.map(function (e) { return { amount: e.amount, source: e.source, role: 'additional' }; }));
+  return fillFromOlder(out, cur, withFee);
+}
+// A revised fee stated in a short email usually leaves CA terms, rates and extras as they were in the proposal.
+function fillFromOlder(out, cur, withFee) {
+  var older = withFee.filter(function (g) { return g !== cur && g.gi > cur.gi && g.r; });
+  older.forEach(function (g) {
+    ['optional', 'reimbursables', 'hourly', 'units', 'percent'].forEach(function (k) { if (!(out[k] || []).length && (g.r[k] || []).length) out[k] = g.r[k]; });
+    if ((!out.caMode || out.caMode === 'unknown') && g.r.caMode && g.r.caMode !== 'unknown') {
+      out.caMode = g.r.caMode;
+      out.ca = g.r.caMode === 'included' ? null : g.r.ca;
+      out.caNote = (g.r.caNote ? g.r.caNote + ' ' : '') + '(from the earlier proposal' + (g.r.caMode === 'included' && g.r.ca != null ? ', where it was ' + money(g.r.ca) : '') + ' — confirm)';
+    }
+  });
+  return out;
+}
 var DECLINE_RE = /(not able to (submit|provide|propose|take on|bid)|unable to (submit|provide|propose|take on|bid|assist)|will not be (able to )?(submitting|bidding|proposing)|won'?t be able to|must decline|have to decline|respectfully decline|(we|i) (will|must|have to|need to) pass|pass on this|not (be )?submitting|not interested|too busy to|no capacity|at capacity)/i;
 
 /* ============================================================
@@ -1825,7 +1991,8 @@ function finishAiResult(j, builtin) {
   if (j.fee_type === 'hourly' && stated == null && !base.length) fee = null;
   var notes = [];
   if (check === 'mismatch') notes.push('The listed items add up to ' + money(itemsTotal) + ', not the stated ' + money(stated) + ' — check the proposal.');
-  if (builtin && builtin.fee != null && fee != null && !near(builtin.fee, fee) && builtin.check === 'match') notes.push('The built-in reader found a total of ' + money(builtin.fee) + ' in ' + builtin.source + ' whose items add up exactly — double-check.');
+  if (builtin && builtin.multi && builtin.fee != null && fee != null && !near(builtin.fee, fee)) notes.push('Several fees were found. The built-in reader takes ' + money(builtin.fee) + ' (' + builtin.source + ') as the current one — double-check.');
+  else if (builtin && builtin.fee != null && fee != null && !near(builtin.fee, fee) && builtin.check === 'match') notes.push('The built-in reader found a total of ' + money(builtin.fee) + ' in ' + builtin.source + ' whose items add up exactly — double-check.');
   if (j.notes) notes.push(String(j.notes).slice(0, 300));
   var conf = j.confidence || '';
   if (check === 'match' && conf !== 'low') conf = 'high';
@@ -1835,6 +2002,7 @@ function finishAiResult(j, builtin) {
     fee: fee, feeType: j.fee_type && j.fee_type !== 'none' ? j.fee_type : '', feeText: totals.length ? totals[totals.length - 1].item : '', statedTotal: stated, itemsTotal: itemsTotal, check: check,
     breakdown: (base.length ? base : subs).map(function (x) { return { item: x.item, amount: x.amount }; }),
     optional: pick('optional'), reimbursables: pick('reimbursable'), hourly: pick('hourly_rate'),
+    alternatives: builtin && builtin.multi ? (builtin.versions || []).filter(function (v) { return fee == null || !near(v.amount, fee); }).map(function (v) { return { amount: v.amount, source: v.role + ' — ' + v.source }; }) : [],
     exclusions: j.exclusions || '', schedule: j.schedule || '', summary: j.summary || '', declined: !!j.declined, source: j.source || '', confidence: conf, aiNote: notes.join(' '),
     ...(function () {
       var caBase = items.filter(function (x) { return x.ca && x.kind === 'base'; }), caSep = items.filter(function (x) { return x.ca && (x.kind === 'optional' || x.kind === 'other'); }), caRate = items.filter(function (x) { return x.ca && x.kind === 'hourly_rate'; });
