@@ -1435,18 +1435,26 @@ function readAttachmentDoc(att, bytes, opts) {
 /* ============================================================
    Fee tabulation (no AI)
    ============================================================ */
-var MONEY_RE = /(?:US\$|\$)\s?(\d{1,3}(?:,\d{3})+|\d+)(\.\d{1,2})?(?:\s?(k|K|M|mm|million)\b)?|\b(\d{1,3}(?:,\d{3})+)(\.\d{2})?\b|\b(\d+(?:,\d{3})*)(\.\d{1,2})?\s?(?:USD|dollars)\b/g;
+var MONEY_RE = /(?:US\$|\$)[ \t]{0,3}(\d{1,3}(?:,\d{3})+|[1-9]\d{0,2}\.\d{3}(?![\d,])|\d+)(\.\d{1,2})?(?:\s?(k|K|M|mm|million)\b)?|\b(\d{1,3}(?:,\d{3})+)(\.\d{2})?\b|\b(\d+(?:,\d{3})*)(\.\d{1,2})?\s?(?:USD|dollars)\b/g;
+var FEE_WORD_RE = /(fee|total|lump|amount|price|cost|compensation|\bsum\b|proposal)/;
 function amountsIn(line, tabular) {
-  var out = [], m, re = new RegExp(MONEY_RE.source, 'g');
+  var out = [], m, re = new RegExp(MONEY_RE.source, 'g'), lowLine = line.toLowerCase(), hasTab = /\t/.test(line);
   while ((m = re.exec(line))) {
     var raw = m[1] || m[4] || m[6], dec = m[2] || m[5] || m[7] || '';
-    var v = parseFloat(raw.replace(/,/g, '') + dec);
+    // "$9.600" is a typo for $9,600 (nobody quotes a fee to a tenth of a cent)
+    var v = /^\d{1,3}\.\d{3}$/.test(raw) ? parseFloat(raw.replace('.', '')) : parseFloat(raw.replace(/,/g, '') + dec);
     var mult = m[3] ? (/^k$/i.test(m[3]) ? 1e3 : 1e6) : 1;
     v = v * mult;
-    var after = line.slice(m.index + m[0].length, m.index + m[0].length + 14).toLowerCase();
+    var after = line.slice(m.index + m[0].length, m.index + m[0].length + 18).toLowerCase();
     var before = line.slice(Math.max(0, m.index - 2), m.index);
-    if (/^\s*(%|percent|sf\b|s\.f\.|sq|square|hours?\b|hrs?\b|units?\b|years?\b|days?\b|weeks?\b|months?\b|sheets?\b|acres?\b|ft\b|feet\b)/.test(after) || /#\s?$/.test(before)) continue;
-    if (!m[1] && !m[6] && v < 1000) continue; // bare numbers need thousands commas
+    if (/^[\s,]*(%|percent|sf\b|s\.f\.|gsf\b|sq|square|hours?\b|hrs?\b|units?\b|years?\b|days?\b|weeks?\b|months?\b|sheets?\b|acres?\b|ft\b|feet\b|students?\b|seats?\b|spaces?\b|cars?\b)/.test(after) || /#\s?$/.test(before)) continue;
+    var bare = !m[1] && !m[6];
+    if (bare && v < 1000) continue; // bare numbers need thousands commas
+    if (bare && !hasTab && !tabular) {
+      // a bare number in a sentence only counts when the sentence is about money, and never right after "square footage of"
+      if (!FEE_WORD_RE.test(lowLine)) continue;
+      if (/(square footage|floor area|\barea|sq\.?\s?ft\.?|\bsf)\s*(of\s*)?(approximately\s*|approx\.?\s*|about\s*|roughly\s*)?$/.test(line.slice(Math.max(0, m.index - 60), m.index).toLowerCase())) continue;
+    }
     out.push({ value: Math.round(v * 100) / 100, index: m.index, text: m[0], per: /^\s*(\/|per\b|an?\s+(hour|hr|visit|month|meeting|sheet|trip)|each\b|ea\.?\b|hourly)/.test(after), perHour: /^\s*(\/\s?(hr|hour|h)\b|per\s+(hour|hr)|an?\s+(hour|hr)|hourly)/.test(after) });
   }
   if (!out.length && tabular) {
@@ -1463,7 +1471,7 @@ function amountsIn(line, tabular) {
   return out;
 }
 var RX = {
-  ignore: /(construction (cost|budget|value|estimate)|project (cost|budget)|budget of|cost of (the )?(work|construction)|estimated cost|insurance|liability|retainer|deposit|late (fee|charge)|interest|minimum charge|invoice|\bpaid\b|balance due|payment|permit fee|application fee|filing fee)/,
+  ignore: /(construction (cost|budget|value|estimate)|project (cost|budget)|budget of|cost of (the )?(work|construction)|estimated cost|insurance|liability|workers'? ?comp|automobile|umbrella|aggregate|per (occurrence|claim)|each occurrence|coverage|retainer|deposit|late (fee|charge|payment)|service charge|interest|minimum charge|not less than|re-?start fee|invoice|\bpaid\b|balance due|payment|permit fee|application fee|filing fee)/,
   hourly: /(\/\s?(hr|hour|h)\b|per hour|hourly|an hour|rate schedule|billing rate|\brates?\b)/,
   reimb: /(reimburs|expenses|printing|reproduction|travel|mileage|postage|courier|delivery|out[- ]of[- ]pocket)/,
   optional: /(optional|billed separately|separate(ly)? (fee|contract|proposal|cost)|in addition to (the|our) (above|fee)|additional services?|add(itional)?[- ]alternate|\balternates?\b|if (required|requested|needed|desired)|not included|excluded|exclusions?|allowance|\boption [a-z0-9]\b|future phase|upon request|as needed|on an as[- ]needed)/,
@@ -1473,6 +1481,7 @@ var RX = {
   per: /(per (visit|meeting|sheet|trip|month|site visit|inspection)|each (visit|meeting|additional)|\beach\b)/,
 };
 function classifyLine(low, amt) {
+  low = low.replace(/payment schedule/g, ' ');
   if (RX.ignore.test(low) && !RX.grand.test(low)) return 'ignore';
   if (amt.perHour || RX.hourly.test(low) && !RX.total.test(low)) return 'hourly';
   if (amt.per) return 'unit';
@@ -1483,27 +1492,51 @@ function classifyLine(low, amt) {
   if (RX.grand.test(low) || RX.total.test(low)) return 'total';
   return 'item';
 }
+// A heading line starts a section; amounts under "Insurance", "Add Alternate", "Hourly Rates" or
+// "Reimbursable Expenses" are never part of the fee.
+function sectionOf(line) {
+  var t = String(line || '').trim();
+  if (!t || t.length > 70 || amountsIn(t).length) return null;
+  var low = t.toLowerCase();
+  var headingish = /:$/.test(t) || (t === t.toUpperCase() && /[A-Z]{4,}/.test(t)) || /^([A-Z]|[IVXL]+|\d{1,2})[.)]\s+[A-Z]/.test(t);
+  var short = t.length <= 45 && !/[.!?,;]$/.test(t) && t.split(/\s+/).length <= 6;
+  if (!headingish && !short) return null;
+  if (/\binsurance\b/.test(low)) return 'insurance';
+  if (/(^|\s)(add[- ]?alternates?|alternates?|optional (services?|items?)|additional services|extra services|services not included|exclusions?)\s*:?$/.test(low)) return 'optional';
+  if (/((hourly|billing|billable) rates?|rate schedule|schedule of rates|standard rates)/.test(low)) return 'rates';
+  if (/reimbursable/.test(low)) return 'reimb';
+  return headingish ? 'other' : null;
+}
 function cleanLabel(s) {
-  return String(s).replace(/\t+/g, ' · ').replace(/[.\u2026_]{3,}/g, ' ').replace(/\s*·\s*(·\s*)+/g, ' · ').replace(/^[\s·:\-–—|,;(]+|[\s·:\-–—|,;(]+$/g, '').replace(/\s{2,}/g, ' ').slice(0, 90);
+  return String(s).replace(/\t+/g, ' · ').replace(/[.…_]{3,}/g, ' ').replace(/\s*·\s*(·\s*)+/g, ' · ').replace(/^[\s·:\-–—|,;(]+|[\s·:\-–—|,;(*]+$/g, '').replace(/\s{2,}/g, ' ').slice(0, 90);
 }
 // Each dollar amount on a line, with the words that belong to it.
 //  Table rows (cells split by tabs): one entry — the last amount, labelled by the text cells.
-//  Sentences: every amount, labelled by the words just before it in the same sentence.
-function lineEntries(line, tabular) {
+//  Sentences: every amount, labelled by the words just before it in the same sentence
+//  (`lead` is the end of the previous line when the sentence wraps).
+function lineEntries(line, tabular, lead) {
   var amts = amountsIn(line, tabular);
   if (!amts.length) return [];
   if (/\t/.test(line)) {
     var a = amts[amts.length - 1];
     var label = line.split('\t').filter(function (c) { return /[a-z]{2,}/i.test(c) && !amountsIn(c, false).length; }).join(' · ');
-    return [{ amt: a, label: cleanLabel(label), ctx: line.toLowerCase() }];
+    return [{ amt: a, label: cleanLabel(label), ctx: line.toLowerCase(), after: '' }];
   }
   return amts.map(function (a, i) {
     var start = i ? amts[i - 1].index + amts[i - 1].text.length : 0;
-    var before = line.slice(start, a.index).replace(/^\s*(\/\s?(hr|hour|h)\b\.?|per\s+\w+|an?\s+(hour|hr)\b|each\b|hourly\b)/i, ''), sentences = before.split(/[.!?;]\s+|,\s*(?:and|plus|with)\s+/);
+    var raw = line.slice(start, a.index);
+    if (i === 0 && lead) raw = lead + ' ' + raw;
+    var before = raw.replace(/^\s*(\/\s?(hr|hour|h)\b\.?|per\s+\w+|an?\s+(hour|hr)\b|each\b|hourly\b)/i, ''), sentences = before.split(/[.!?;]\s+|,\s*(?:and|plus|with)\s+/);
     var ctx = sentences[sentences.length - 1];
     if (!/[a-z]{3,}/i.test(ctx) && i === 0) ctx = before;
+    var end = i + 1 < amts.length ? amts[i + 1].index : line.length;
+    var after = line.slice(a.index + a.text.length, end).split(/[.!?;]\s|,\s/)[0].slice(0, 70);
     var tail = cleanLabel(ctx.replace(/\b(at|of|is|be|for|to|will be|would be|shall be|totaling|totalling|amounting to)\s*$/i, ''));
-    return { amt: a, label: tail.length > 70 ? '…' + tail.slice(-70) : tail, ctx: ctx.toLowerCase() };
+    var label = tail.length > 70 ? '…' + tail.slice(-70) : tail;
+    // "$10,000 for the gym": the words after the amount name it better than the words before
+    var afterLabel = /^\s*for\s+\w/i.test(after) ? cleanLabel(after.replace(/^\s*for\s+(the\s+)?/i, '').replace(/\s+(payable|and|which|to be|as|per|plus|with)\b.*$/i, '')) : '';
+    if (afterLabel && (!label || a.index < 3 || i > 0)) label = afterLabel;
+    return { amt: a, label: label, ctx: ctx.toLowerCase(), after: after.toLowerCase(), afterLabel: afterLabel };
   });
 }
 function labelOf(line, amt) {
@@ -1512,6 +1545,18 @@ function labelOf(line, amt) {
 }
 var near = function (a, b) { return Math.abs(a - b) <= Math.max(1, Math.abs(b) * 0.002); };
 var sum = function (arr) { return Math.round(arr.reduce(function (s, x) { return s + x.amount; }, 0) * 100) / 100; };
+// first run of 2+ consecutive entries (from index `from`) that adds up to `target`
+function runSummingTo(items, target, from) {
+  for (var i = from || 0; i < items.length - 1; i++) {
+    var s = 0;
+    for (var j = i; j < items.length; j++) {
+      s += items[j].amount;
+      if (j > i && near(s, target)) return [i, j];
+      if (s > target * 1.002 + 1) break;
+    }
+  }
+  return null;
+}
 
 // docs: [{ name, text, tabular, order }] newest first. Returns the best fee with its breakdown and checks.
 function analyzeFee(docs) {
@@ -1519,25 +1564,69 @@ function analyzeFee(docs) {
   var addU = function (arr, x) { if (!arr.some(function (y) { return y.amount === x.amount && y.item === x.item; }) && arr.length < 12) arr.push(x); };
   docs.forEach(function (doc, di) {
     allText += '\n' + String(doc.text || '');
-    var lines = String(doc.text || '').split('\n'), block = { items: [], subs: [] }, quiet = 0, ctx = '';
+    var lines = String(doc.text || '').split('\n'), block = { items: [], subs: [] }, quiet = 0, ctx = '', section = null, sectionAt = -99;
+    var pending = [], docCands = [], lastQuiet = '';
     var fresh = 2 - Math.min(2, di * 0.5) + (/revis|updated|final/i.test(doc.name + ' ' + String(doc.text).slice(0, 300)) ? 1 : 0);
-    var flush = function () {
+    var addCand = function (c) { c.source = doc.name; cands.push(c); docCands.push(c); return c; };
+    var matched = function (c, items) {
+      c.items = items.slice(); c.itemsTotal = sum(items); c.check = 'match';
+      c.score = 10 + Math.min(2, items.length * 0.3) + fresh + (c.grand ? 1 : 0);
+      c.first = Math.min.apply(null, items.map(function (x) { return x.li; }).concat([c.li]));
+      c.last = Math.max.apply(null, items.map(function (x) { return x.li; }).concat([c.li]));
+    };
+    // a total stated BEFORE its breakdown ("lump sum of $48,000 payable as follows: …")
+    var matchPending = function (li) {
+      pending = pending.filter(function (p) { return li - p.li <= 45; });
+      pending.forEach(function (p) {
+        if (p.check !== 'stated') return;
+        var r = runSummingTo(block.items, p.fee, 0);
+        if (r) { matched(p, block.items.slice(r[0], r[1] + 1)); block.items.splice(r[0], r[1] - r[0] + 1); }
+      });
+      pending = pending.filter(function (p) { return p.check === 'stated'; });
+    };
+    var flush = function (li) {
+      matchPending(li);
+      // an amount followed by rows that add up to it is a total too ("…and $10,000 for the gym", then the gym rows)
+      for (var i = 0; i < block.items.length - 2; i++) {
+        var r = runSummingTo(block.items, block.items[i].amount, i + 1);
+        if (r && r[0] === i + 1) {
+          var head = block.items[i];
+          var c = addCand({ fee: head.amount, stated: head.amount, label: head.item, li: head.li });
+          matched(c, block.items.slice(r[0], r[1] + 1));
+          block.items.splice(i, r[1] - i + 1); i--;
+        }
+      }
       var parts = block.subs.length ? block.subs.concat(block.items) : block.items;
-      if (parts.length >= 2) cands.push({ fee: sum(parts), items: parts.slice(), check: 'computed', score: 4.5 + fresh + (/(fee|compensation|proposal|price)/i.test(ctx) ? 1 : 0), source: doc.name, label: 'Sum of ' + parts.length + ' fee items' });
-      else if (parts.length === 1 && /\bfee\b|compensation|price/i.test(parts[0].item)) cands.push({ fee: parts[0].amount, items: [], check: 'single', score: 3 + fresh, source: doc.name, label: parts[0].item });
+      if (parts.length >= 2 && sum(parts) >= 500) addCand({ fee: sum(parts), items: parts.slice(), check: 'computed', score: 4.5 + fresh + (/(fee|compensation|proposal|price)/i.test(ctx) ? 1 : 0), label: 'Sum of ' + parts.length + ' fee items', li: parts[0].li, first: parts[0].li, last: parts[parts.length - 1].li, title: block.title });
+      else if (parts.length === 1 && /\bfee\b|compensation|price/i.test(parts[0].item)) addCand({ fee: parts[0].amount, items: [], check: 'single', score: 3 + fresh, label: parts[0].item, li: parts[0].li });
       block = { items: [], subs: [] };
     };
     lines.forEach(function (line, li) {
       var low = line.toLowerCase();
       var pm = low.match(/(\d+(?:\.\d+)?)\s?%\s*(?:of|of the)\s*(?:the\s*)?(?:total\s*)?(?:construction|project|building)\s*(?:cost|budget|value)/);
       if (pm && /fee|compensation/.test(low + ' ' + (lines[li - 1] || '').toLowerCase())) percent.push(pm[1] + '%');
-      var ents = lineEntries(line, doc.tabular);
+      // the end of the previous line, when this line continues its sentence
+      var lead = '';
+      if (li > 0 && !/\t/.test(line)) {
+        var prev = lines[li - 1].trim();
+        if (prev.length > 20 && !/[.:!?]$/.test(prev)) {
+          var pa = amountsIn(prev), cut = pa.length ? pa[pa.length - 1].index + pa[pa.length - 1].text.length : 0;
+          lead = prev.slice(cut).replace(/\t+/g, ' ');
+          var ls = lead.split(/[.!?;]\s+/); lead = ls[ls.length - 1];
+        }
+      }
+      var ents = lineEntries(line, doc.tabular, lead);
       if (!ents.length) {
-        if (line.trim()) { quiet++; ctx = (ctx + ' ' + line).slice(-200); }
-        if (quiet >= 4) flush();
+        var sec = sectionOf(line);
+        if (sec) { section = sec === 'other' ? null : sec; sectionAt = li; matchPending(li); }
+        // "Construction Administration ……… Hourly T&M" (no dollar amount on the line)
+        if (CA_RE.test(line) && /(hourly|time\s*(and|&)\s*materials?|\bt\s?&\s?m\b|per hour)/i.test(line)) caSeen.push({ item: cleanLabel(line), amount: null, kind: 'hourly', source: doc.name, line: line.trim().slice(0, 160) });
+        if (line.trim()) { quiet++; ctx = (ctx + ' ' + line).slice(-200); lastQuiet = line.trim(); }
+        if (quiet >= 4) flush(li);
         return;
       }
-      quiet = 0;
+      var wasQuiet = quiet > 0; quiet = 0;
+      if (section === 'optional' && li - sectionAt > 15) section = null;
       ents.forEach(function (en) {
         var amt = en.amt, kind = classifyLine(en.ctx, amt), item = en.label;
         // a label on the line above ("Total Fee:" ↵ "$48,500")
@@ -1546,40 +1635,100 @@ function analyzeFee(docs) {
           if (prev && !amountsIn(prev).length) { item = cleanLabel(prev); kind = classifyLine(prev.toLowerCase(), amt); }
         }
         if (!item) item = 'Line ' + (li + 1);
-        var entry = { item: item, amount: amt.value, line: line.trim().slice(0, 160) };
+        // payment-schedule rows ("20%  $9,600  Retainer due upon signing") are part of the fee
+        if (kind === 'ignore' && /^\s*\d{1,3}(\.\d+)?\s?%/.test(line) && !/insurance|liability|construction cost|interest/.test(low)) kind = 'item';
+        var grandLine = RX.grand.test(en.ctx);
+        if (section === 'insurance') kind = 'ignore';
+        else if (section === 'rates' && !grandLine) kind = amt.per && !amt.perHour ? 'unit' : 'hourly';
+        else if (section === 'reimb' && !grandLine) kind = 'reimb';
+        else if (section === 'optional' && (kind === 'item' || kind === 'total' || kind === 'subtotal')) kind = 'optional';
+        var entry = { item: item, amount: amt.value, line: line.trim().slice(0, 160), li: li };
         if (kind === 'ignore') return;
-        if (CA_RE.test(item) || CA_RE.test(en.ctx)) caSeen.push({ item: item, amount: amt.value, kind: kind, source: doc.name, line: entry.line });
+        var caHere = CA_RE.test(item) || CA_RE.test(en.ctx) || /^\s*for\b/.test(en.after) && CA_RE.test(en.after);
+        var rateKind = kind === 'hourly' || kind === 'unit';
+        if (rateKind && (caHere || CA_RE.test(line))) caSeen.push({ item: cleanLabel(((CA_RE.test(line) ? '' : lead + ' ') + line.trim()).slice(0, 110)), amount: null, kind: kind, source: doc.name, line: entry.line });
+        else if (caHere) caSeen.push({ item: item, amount: amt.value, kind: kind, source: doc.name, line: entry.line });
         if (kind === 'hourly') { addU(hourly, entry); return; }
         if (kind === 'reimb') { addU(reimb, entry); return; }
         if (kind === 'optional') { addU(optional, entry); return; }
         if (kind === 'unit') { addU(units, entry); return; }
-        var low = en.ctx;
+        var low2 = en.ctx;
+        if (!block.items.length && !block.subs.length) block.title = wasQuiet && lastQuiet.length <= 70 && !/[.;,]$/.test(lastQuiet) ? cleanLabel(lastQuiet) : '';
         if (kind === 'subtotal') {
           var s1 = sum(block.items);
-          block.subs.push({ item: item, amount: amt.value, items: block.items.slice(), ok: block.items.length ? near(s1, amt.value) : null });
+          block.subs.push({ item: item, amount: amt.value, items: block.items.slice(), ok: block.items.length ? near(s1, amt.value) : null, li: li });
           block.items = []; return;
         }
         if (kind === 'total') {
+          matchPending(li);
           var parts = block.subs.length ? block.subs.concat(block.items) : block.items;
-          var grand = RX.grand.test(low), nte = /not[\s-]to[\s-]exceed|\bnte\b/.test(low), lump = /lump[\s-]?sum|fixed fee|stipulated/.test(low);
-          var c = { fee: amt.value, stated: amt.value, items: parts.slice(), source: doc.name, label: item, nte: nte, lump: lump, grand: grand };
-          if (parts.length >= 2) {
-            c.itemsTotal = sum(parts);
-            c.check = near(c.itemsTotal, amt.value) ? 'match' : 'mismatch';
-            c.score = (c.check === 'match' ? 10 + Math.min(2, parts.length * 0.3) : 5.5) + fresh + (grand ? 1 : 0);
+          var grand = RX.grand.test(low2), nte = /not[\s-]to[\s-]exceed|\bnte\b/.test(low2), lump = /lump[\s-]?sum|fixed fee|stipulated/.test(low2);
+          var c = { fee: amt.value, stated: amt.value, items: [], label: item, nte: nte, lump: lump, grand: grand, li: li, first: li, last: li, title: block.title, afterLabel: en.afterLabel };
+          var use = null;
+          // "…for a fee of $60,000 … estimated at $14,000 … TOTAL FEE $74,000": the earlier stated amount is a part of this total
+          var recent = pending.filter(function (p) { return p.check === 'stated' && li - p.li <= 12 && p.fee < amt.value; });
+          if (recent.length) {
+            var withP = recent.map(function (p) { return { item: p.label, amount: p.fee, li: p.li }; }).concat(parts).sort(function (x, y) { return x.li - y.li; });
+            if (withP.length >= 2 && near(sum(withP), amt.value)) {
+              use = withP;
+              recent.forEach(function (p) { [cands, docCands, pending].forEach(function (arr) { var ix = arr.indexOf(p); if (ix >= 0) arr.splice(ix, 1); }); });
+            }
+          }
+          if (!use && parts.length >= 2) {
+            if (near(sum(parts), amt.value)) use = parts;
+            else for (var k = 2; k < parts.length && !use; k++) if (near(sum(parts.slice(-k)), amt.value)) use = parts.slice(-k); // the rows right above the total
+          }
+          if (use) matched(c, use);
+          else if (parts.length >= 2 && li - parts[0].li <= 12 && !(parts.length && near(parts[parts.length - 1].amount, amt.value))) {
+            c.items = parts.slice(); c.itemsTotal = sum(parts); c.check = 'mismatch'; c.score = 5.5 + fresh + (grand ? 1 : 0); c.first = parts[0].li;
           } else {
             c.check = 'stated';
-            c.score = (grand || lump || nte ? 7 : 5.5) + fresh + (parts.length === 1 && near(parts[0].amount, amt.value) ? 1 : 0);
+            c.score = (grand || lump || nte ? 7 : 5.5) + fresh + (parts.length && near(parts[parts.length - 1].amount, amt.value) ? 1 : 0);
+            pending.push(c);
           }
           if (block.subs.some(function (x) { return x.ok === false; })) { c.subNote = 'A subtotal doesn\'t match its items.'; c.score -= 1; }
-          cands.push(c);
+          addCand(c);
           block = { items: [], subs: [] };
           return;
         }
         block.items.push(entry);
       });
     });
-    flush();
+    flush(lines.length);
+    // Separate totals for separate parts of the job (main building + gym): the fee is their sum.
+    var tot = docCands.filter(function (c) { return (c.check === 'match' || c.check === 'mismatch') && !c.parts; }).sort(function (a, b) { return a.li - b.li; });
+    for (var i = 0; i < tot.length - 1; i++) {
+      var group = [tot[i]];
+      for (var j = i + 1; j < tot.length && group.length < 4; j++) {
+        var a = group[group.length - 1], b = tot[j];
+        var adjacent = b.li - a.li <= 1 || b.first - a.last <= 3 && b.first > a.li - 1;
+        if (!adjacent) break;
+        group.push(b);
+      }
+      if (group.length < 2) continue;
+      var distinct = group.every(function (g, gi) { return group.every(function (h, hi) { return gi === hi || !near(g.fee, h.fee); }); });
+      var optionLike = group.some(function (g) { return /(option|alternate|scheme|scenario)\b/i.test((g.title || '') + ' ' + (g.label || '')); });
+      var total = Math.round(group.reduce(function (s, g) { return s + g.fee; }, 0) * 100) / 100;
+      if (!distinct || optionLike) continue;
+      var restated = docCands.filter(function (c) { return group.indexOf(c) < 0 && near(c.fee, total); });
+      var allOk = group.every(function (g) { return g.check !== 'mismatch'; });
+      var partItems = group.map(function (g, gi) { return { item: g.afterLabel ? g.afterLabel : g.title && !RX.total.test(g.title.toLowerCase()) ? g.title : /^(total|sub[- ]?total)$/i.test(g.label || '') || !g.label ? 'Part ' + (gi + 1) : g.label, amount: g.fee, items: (g.items || []).slice(), li: g.li }; });
+      var bad = group.filter(function (g) { return g.check === 'mismatch'; });
+      // a grand total that restates the sum of the parts: that total is the fee, and the parts are its breakdown
+      if (restated.length) {
+        var topScore = Math.max.apply(null, group.map(function (g) { return g.score; })) + 1.5;
+        restated.forEach(function (c) { if (c.check === 'stated' || c.check === 'single') { c.items = partItems; c.itemsTotal = total; c.check = 'match'; } c.score = Math.max(c.score, topScore); });
+        i += group.length - 1; continue;
+      }
+      addCand({
+        fee: total, stated: total, items: partItems, itemsTotal: Math.round(group.reduce(function (s, g) { return s + (g.itemsTotal != null ? g.itemsTotal : g.fee); }, 0) * 100) / 100,
+        check: allOk ? 'match' : 'mismatch', parts: true, label: group.length + ' separate totals added together', li: group[0].li, first: group[0].first, last: group[group.length - 1].last,
+        score: Math.max.apply(null, group.map(function (g) { return g.score; })) + 1.5 + (allOk ? 0 : 4),
+        partsNote: bad.length ? bad.map(function (g, gi) { return 'For "' + partItems[group.indexOf(g)].item + '" the items add up to ' + money(g.itemsTotal) + ', not the stated ' + money(g.fee) + '.'; }).join(' ') : '',
+        lump: group.some(function (g) { return g.lump; }), nte: group.some(function (g) { return g.nte; }),
+      });
+      i += group.length - 1;
+    }
   });
   if (!cands.length) {
     return Object.assign({ fee: null, feeType: hourly.length ? 'hourly' : percent.length ? 'percentage' : '', check: null, breakdown: [], optional: optional, reimbursables: reimb, hourly: hourly, units: units, percent: percent,
@@ -1589,18 +1738,21 @@ function analyzeFee(docs) {
   var best = cands[0];
   // the same total stated in several places adds confidence
   var agree = cands.filter(function (c) { return c !== best && near(c.fee, best.fee); }).length;
-  var alts = []; cands.slice(1).forEach(function (c) { if (!near(c.fee, best.fee) && !alts.some(function (a) { return near(a.amount, c.fee); }) && alts.length < 3) alts.push({ amount: c.fee, source: c.source, label: c.label }); });
+  var alts = []; cands.slice(1).forEach(function (c) { if (!near(c.fee, best.fee) && !alts.some(function (a) { return near(a.amount, c.fee); }) && alts.length < 3 && !(best.parts && best.items.some(function (p) { return near(p.amount, c.fee); }))) alts.push({ amount: c.fee, source: c.source, label: c.label }); });
   var feeType = best.nte ? 'not to exceed' : best.lump || best.check === 'match' || best.check === 'stated' ? 'lump sum' : best.check === 'computed' ? 'sum of items' : '';
   var conf = best.check === 'match' || (best.check === 'stated' && agree) ? 'high' : best.check === 'stated' || best.check === 'computed' ? 'medium' : 'low';
   if (alts.length && conf === 'high' && best.check !== 'match') conf = 'medium';
+  if (best.parts) conf = best.check === 'match' ? 'medium' : 'low';
   var breakdown = best.items.map(function (x) { return { item: x.item, amount: x.amount }; });
   var parts = [];
-  if (best.check === 'match') parts.push(money(best.fee) + ' total — the ' + breakdown.length + ' items add up exactly.');
+  if (best.parts) parts.push(breakdown.length + ' separate totals (' + breakdown.map(function (x) { return x.item + ' ' + money(x.amount); }).join(' + ') + ') add up to ' + money(best.fee) + '.' + (best.partsNote ? ' ' + best.partsNote + ' Check the proposal.' : ''));
+  else if (best.check === 'match') parts.push(money(best.fee) + ' total — the ' + breakdown.length + ' items add up exactly.');
   else if (best.check === 'mismatch') parts.push('Stated total ' + money(best.stated) + ', but the items add up to ' + money(best.itemsTotal) + ' — check the proposal.');
   else if (best.check === 'computed') parts.push('No total stated; the ' + breakdown.length + ' fee items add up to ' + money(best.fee) + '.');
   else parts.push(money(best.fee) + ' (' + (best.label || 'stated fee') + ').');
-  if (reimb.length) parts.push('Reimbursables listed separately (' + reimb.map(function (r) { return money(r.amount); }).join(', ') + ').');
-  if (optional.length) parts.push(optional.length + ' optional / additional item' + (optional.length === 1 ? '' : 's') + ' not included.');
+  var bigReimb = reimb.filter(function (r) { return r.amount >= 50; });
+  if (bigReimb.length) parts.push('Reimbursables listed separately (' + bigReimb.slice(0, 4).map(function (r) { return money(r.amount); }).join(', ') + ').');
+  if (optional.length) parts.push(optional.length + ' optional / additional item' + (optional.length === 1 ? '' : 's') + ' not included (' + optional.slice(0, 3).map(function (o) { return money(o.amount); }).join(', ') + ').');
   return {
     fee: best.fee, feeType: feeType, feeText: best.label, statedTotal: best.stated != null ? best.stated : null, itemsTotal: best.itemsTotal != null ? best.itemsTotal : (best.check === 'computed' ? best.fee : null),
     check: best.check, breakdown: breakdown, optional: optional, reimbursables: reimb, hourly: hourly, units: units, percent: percent,
@@ -1616,16 +1768,16 @@ function caInfo(best, caSeen, text) {
   var flat = [];
   (best ? best.items : []).forEach(function (x) { if (x.items && x.items.length) x.items.forEach(function (y) { flat.push(y); }); else flat.push(x); });
   var inFee = flat.filter(function (x) { return CA_RE.test(x.item); });
-  if (inFee.length) return { caMode: 'included', ca: sum(inFee), caNote: inFee.map(function (x) { return x.item; }).join(', ') };
+  if (inFee.length) return { caMode: 'included', ca: sum(inFee), caNote: inFee.map(function (x) { return x.item; }).filter(function (x, i, a) { return a.indexOf(x) === i; }).join(', ') };
   var amounts = {}; var pick = function (arr) { var out = []; arr.forEach(function (x) { if (!amounts[x.amount]) { amounts[x.amount] = 1; out.push(x); } }); return out; };
-  var sep = pick(caSeen.filter(function (x) { return ['item', 'optional', 'total', 'subtotal'].indexOf(x.kind) >= 0 && !(best && near(x.amount, best.fee)); }));
+  var sep = pick(caSeen.filter(function (x) { return x.amount != null && ['item', 'optional', 'total', 'subtotal'].indexOf(x.kind) >= 0 && !(best && near(x.amount, best.fee)); }));
   if (sep.length) {
     var same = sep.filter(function (x) { return best && x.source === best.source; });
     var use = same.length ? same : sep;
     return { caMode: 'separate', ca: sum(use), caNote: use.map(function (x) { return x.item; }).join(', ') };
   }
   var rate = caSeen.filter(function (x) { return x.kind === 'hourly' || x.kind === 'unit'; });
-  if (rate.length) return { caMode: 'hourly', ca: null, caNote: rate.slice(0, 3).map(function (x) { return x.item + ' ' + money(x.amount); }).join(', ') };
+  if (rate.length) return { caMode: 'hourly', ca: null, caNote: rate.slice(0, 3).map(function (x) { return x.item + (x.amount != null ? ' ' + money(x.amount) : ''); }).filter(function (x, i, a) { return a.indexOf(x) === i; }).join(', ') };
   if (CA_EXCLUDED_RE.test(text || '')) return { caMode: 'excluded', ca: null, caNote: 'Proposal says CA is not included' };
   return { caMode: 'unknown', ca: null };
 }
