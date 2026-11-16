@@ -1950,6 +1950,7 @@ const ICONS = {
   search: 'M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z',
   add: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z',
   close: 'M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z',
+  download: 'M5 20h14v-2H5v2zM19 9h-4V3H9v6H5l7 7 7-7z',
   trash: 'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z',
   cloud: 'M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z',
   link: 'M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z',
@@ -4208,7 +4209,8 @@ function NavItem({
   count,
   active,
   onClick,
-  onDelete
+  onDelete,
+  onExport
 }) {
   return /*#__PURE__*/React.createElement("div", {
     onClick: onClick,
@@ -4219,7 +4221,18 @@ function NavItem({
     className: active ? 'text-[#001d35]' : 'text-muted'
   }), /*#__PURE__*/React.createElement("span", {
     className: "truncate flex-1"
-  }, label), onDelete && /*#__PURE__*/React.createElement("button", {
+  }, label), onExport && /*#__PURE__*/React.createElement("button", {
+    title: "Export this project",
+    onClick: e => {
+      e.stopPropagation();
+      onExport();
+    },
+    "data-keep-open": true,
+    className: "hidden group-hover:block max-md:block text-muted hover:text-blueprint"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    name: "download",
+    className: "w-[18px] h-[18px]"
+  })), onDelete && /*#__PURE__*/React.createElement("button", {
     title: "Delete project",
     onClick: e => {
       e.stopPropagation();
@@ -4325,6 +4338,7 @@ function Sidebar({
         setActiveId(p.id);
         onPickProject && onPickProject();
       },
+      onExport: () => rfpExportProject(p, roster),
       onDelete: () => {
         if (!confirm('Delete "' + (p.projectName || 'Untitled project') + '"?')) return;
         const rest = projects.filter(x => x.id !== p.id);
@@ -8532,6 +8546,24 @@ function rfpExportFile() {
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   return { projects: projects.length, roster: roster.length };
 }
+function rfpExportProject(p, roster) {
+  const ids = new Set(p.enabledConsultantIds || []);
+  const data = {
+    app: 'rfp-automator',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    projects: [p],
+    roster: (roster || []).filter(c => ids.has(c.id))
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  const name = ((p.projectNumber ? p.projectNumber + ' ' : '') + (p.projectName || 'Untitled project')).replace(/[\\/:*?"<>|]+/g, '-').trim();
+  a.href = URL.createObjectURL(blob);
+  a.download = 'RFP - ' + name + '.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
 function rfpMergeImport(data) {
   if (!data || data.app !== 'rfp-automator' || !Array.isArray(data.projects) || !Array.isArray(data.roster)) throw new Error('This file is not an RFP Automator export.');
   const roster = (load('rfp_roster', []) || []).slice();
@@ -8583,7 +8615,7 @@ function BackupSection() {
     className: "space-y-3"
   }, /*#__PURE__*/React.createElement(Eyebrow, null, "Move to another browser"), /*#__PURE__*/React.createElement("p", {
     className: "text-[12px] text-ink/55"
-  }, "Projects and the consultant roster are saved in this browser only. Export them to a file, then Import that file in the other browser."), /*#__PURE__*/React.createElement("div", {
+  }, "Projects and the consultant roster are saved in this browser only. Export them to a file, then Import that file in the other browser. To move one project, hover it in the Projects list and click its download icon."), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-2"
   }, /*#__PURE__*/React.createElement(Btn, {
     kind: "ghost",
