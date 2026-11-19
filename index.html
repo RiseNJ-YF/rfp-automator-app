@@ -4561,6 +4561,8 @@ function App() {
     sigHtml: sigHtml,
     onSend: sendFollowUps,
     loadCc: followUpCc,
+    canReadThread: () => !!google.email && tokenValid(60000) && hasScope(SCOPES.read),
+    connectRead: () => ensureGoogle(SCOPES.read, 'read the email threads'),
     contacts: google.contacts,
     onLogOutside: rows => {
       rows.forEach(r => logFollowUp(r.project.id, r.c.id, Date.now(), 'logged as done outside the app'));
@@ -7554,20 +7556,28 @@ function FollowUpDialog({
   onSend,
   onLogOutside,
   contacts,
-  loadCc
+  loadCc,
+  canReadThread,
+  connectRead
 }) {
   const [tpl, setTpl] = useState('');
   const [threadCc, setThreadCc] = useState([]);
   const [dropCc, setDropCc] = useState([]);
   const [ccLoading, setCcLoading] = useState(false);
-  useEffect(() => {
-    if (!open || !loadCc) return;
-    let live = true;
+  const [ccNeedsAuth, setCcNeedsAuth] = useState(false);
+  const loadRef = useRef(0);
+  const loadThreadCc = () => {
+    const my = ++loadRef.current;
     setThreadCc([]);
-    setDropCc([]);
+    if (canReadThread && !canReadThread()) {
+      setCcNeedsAuth(true);
+      setCcLoading(false);
+      return;
+    }
+    setCcNeedsAuth(false);
     setCcLoading(true);
     Promise.all(rows.slice(0, 12).map(r => loadCc(r).catch(() => []))).then(lists => {
-      if (!live) return;
+      if (my !== loadRef.current) return;
       const seen = {},
         all = [];
       lists.flat().forEach(a => {
@@ -7579,8 +7589,13 @@ function FollowUpDialog({
       setThreadCc(all);
       setCcLoading(false);
     });
+  };
+  useEffect(() => {
+    if (!open || !loadCc) return;
+    setDropCc([]);
+    loadThreadCc();
     return () => {
-      live = false;
+      loadRef.current++;
     };
   }, [open]);
   const [sending, setSending] = useState(false);
@@ -7646,7 +7661,17 @@ function FollowUpDialog({
     className: "flex flex-wrap gap-1.5 items-center flex-1 min-w-0"
   }, ccLoading && /*#__PURE__*/React.createElement("span", {
     className: "text-[12px] text-muted"
-  }, "Checking the thread for people they added…"), threadCc.filter(a => !dropCc.includes(a.email)).map(a => /*#__PURE__*/React.createElement("span", {
+  }, "Checking the thread for people they added…"), ccNeedsAuth && /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    onClick: async () => {
+      if (connectRead && (await connectRead())) loadThreadCc();
+    },
+    title: "Connect Google so the app can read the email thread and Cc the people the consultant added",
+    className: "h-7 px-2.5 rounded-full border border-[#747775] text-[12px] text-blueprint hover:bg-hoverbg",
+    style: {
+      borderStyle: 'dashed'
+    }
+  }, "Connect Google to show people they Cc'd"), threadCc.filter(a => !dropCc.includes(a.email)).map(a => /*#__PURE__*/React.createElement("span", {
     key: a.email,
     title: a.email + ' \u2014 added by the consultant in the email thread',
     className: "inline-flex items-center gap-1.5 bg-[#f1f3f4] rounded-full pl-0.5 pr-1 h-7 text-[13px]"
