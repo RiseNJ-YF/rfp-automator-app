@@ -695,6 +695,44 @@ function gmailHeaders(id, names) {
     return { id: m.id, threadId: m.threadId, snippet: m.snippet || '', internalDate: Number(m.internalDate) || 0, labelIds: m.labelIds || [], headers: h };
   });
 }
+// "Jami Lynn <jlynn@x.com>, kf@x.com" -> [{name, email}]
+function parseAddrList(s) {
+  var out = [], re = /(?:"([^"]*)"|([^,;<>"]*?))\s*<([^<>\s]+@[^<>\s]+)>|([^\s,;<>"]+@[^\s,;<>"]+)/g, m;
+  s = String(s || '');
+  while ((m = re.exec(s))) {
+    var nm = (m[1] || m[2] || '').trim();
+    out.push({ name: /@/.test(nm) ? '' : nm, email: (m[3] || m[4]).trim().toLowerCase() });
+  }
+  return out;
+}
+// Everyone the consultant's side brought into the conversation: people they put in To/Cc of their replies,
+// and colleagues who wrote in. Only messages that came back to us count, not ones we sent.
+function threadPeople(threadIds, exclude) {
+  var ex = {};
+  (exclude || []).forEach(function (e) { if (e) ex[String(e).toLowerCase()] = 1; });
+  var ids = (threadIds || []).filter(function (x, i, a) { return x && a.indexOf(x) === i; }).slice(0, 8);
+  var q = 'format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc';
+  return Promise.all(ids.map(function (id) {
+    return gfetch('https://gmail.googleapis.com/gmail/v1/users/me/threads/' + id + '?' + q).catch(function () { return null; });
+  })).then(function (ts) {
+    var out = [], seen = {};
+    ts.forEach(function (t) {
+      ((t && t.messages) || []).forEach(function (m) {
+        var lb = m.labelIds || [];
+        if (lb.indexOf('SENT') >= 0 || lb.indexOf('DRAFT') >= 0) return;
+        ((m.payload && m.payload.headers) || []).forEach(function (h) {
+          if (!/^(from|to|cc)$/i.test(h.name)) return;
+          parseAddrList(h.value).forEach(function (a) {
+            if (ex[a.email] || seen[a.email] || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)@/i.test(a.email)) return;
+            seen[a.email] = 1;
+            out.push(a);
+          });
+        });
+      });
+    });
+    return out;
+  });
+}
 // Latest message from `email` received after `afterMs` (any thread), plus whether any of them has an attachment.
 // Latest reply about this RFP: from the consultant, a colleague at their firm (when about this project), or anyone in the RFP thread.
 function findReply(email, afterMs, ctx) {
@@ -3234,6 +3272,13 @@ function App() {
     if (view === 'home' || view === 'alltracking') checkReplies(projects.filter(p => Object.keys(p.sentLog || {}).length && Date.now() - (p.trackingCheckedAt || 0) > 5 * 60000).map(p => p.id), false);
   }, [view, active.id]);
 
+  // People the consultant added to the conversation, to Cc on the follow-up.
+  const followUpCc = r => {
+    if (!google.email || !hasScope(SCOPES.read)) return Promise.resolve([]);
+    const ms = r.members || [r];
+    const threads = ms.flatMap(m => [m.sent && mine(m.sent) ? m.sent.threadId : ''].concat(repliesOf(m.t || {}).map(x => x.threadId)));
+    return threadPeople(threads, [google.email, fromEmail].concat(ms.map(m => m.c.email), splitAddrs((r.project || {}).ccEmail)));
+  };
   // Send follow-ups as replies in each consultant's original thread.
   const sendFollowUps = async (rows, tpl, onProgress, extra) => {
     extra = extra || {};
@@ -3268,7 +3313,13 @@ function App() {
           name: '',
           email: em
         })));
-        const cc = splitAddrs(p.ccEmail).concat(splitAddrs(extra.cc)).filter((x, i, a) => a.indexOf(x) === i);
+        const dropped = (extra.dropCc || []).map(x => x.toLowerCase());
+        const toKeys = to.map(x => String(x.email).toLowerCase());
+        let added = [];
+        try {
+          added = (await followUpCc(r)).map(a => a.email).filter(em => !dropped.includes(em));
+        } catch (e) {}
+        const cc = splitAddrs(p.ccEmail).concat(added, splitAddrs(extra.cc)).filter((x, i, a) => !toKeys.includes(x.toLowerCase()) && a.findIndex(y => y.toLowerCase() === x.toLowerCase()) === i);
         const mime = buildMime({
           fromName,
           fromEmail,
@@ -4509,6 +4560,7 @@ function App() {
     settings: settings,
     sigHtml: sigHtml,
     onSend: sendFollowUps,
+    loadCc: followUpCc,
     contacts: google.contacts,
     onLogOutside: rows => {
       rows.forEach(r => logFollowUp(r.project.id, r.c.id, Date.now(), 'logged as done outside the app'));
@@ -7501,9 +7553,36 @@ function FollowUpDialog({
   sigHtml,
   onSend,
   onLogOutside,
-  contacts
+  contacts,
+  loadCc
 }) {
   const [tpl, setTpl] = useState('');
+  const [threadCc, setThreadCc] = useState([]);
+  const [dropCc, setDropCc] = useState([]);
+  const [ccLoading, setCcLoading] = useState(false);
+  useEffect(() => {
+    if (!open || !loadCc) return;
+    let live = true;
+    setThreadCc([]);
+    setDropCc([]);
+    setCcLoading(true);
+    Promise.all(rows.slice(0, 12).map(r => loadCc(r).catch(() => []))).then(lists => {
+      if (!live) return;
+      const seen = {},
+        all = [];
+      lists.flat().forEach(a => {
+        if (!seen[a.email]) {
+          seen[a.email] = 1;
+          all.push(a);
+        }
+      });
+      setThreadCc(all);
+      setCcLoading(false);
+    });
+    return () => {
+      live = false;
+    };
+  }, [open]);
   const [sending, setSending] = useState(false);
   const [done, setDone] = useState(0);
   const [extraTo, setExtraTo] = useState('');
@@ -7563,13 +7642,31 @@ function FollowUpDialog({
     className: "flex gap-2 py-1.5 text-[14px]"
   }, /*#__PURE__*/React.createElement("span", {
     className: "text-muted w-16 shrink-0"
-  }, "Cc"), /*#__PURE__*/React.createElement("input", {
+  }, "Cc"), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-1.5 items-center flex-1 min-w-0"
+  }, ccLoading && /*#__PURE__*/React.createElement("span", {
+    className: "text-[12px] text-muted"
+  }, "Checking the thread for people they added…"), threadCc.filter(a => !dropCc.includes(a.email)).map(a => /*#__PURE__*/React.createElement("span", {
+    key: a.email,
+    title: a.email + ' \u2014 added by the consultant in the email thread',
+    className: "inline-flex items-center gap-1.5 bg-[#f1f3f4] rounded-full pl-0.5 pr-1 h-7 text-[13px]"
+  }, /*#__PURE__*/React.createElement(Avatar, {
+    name: a.name || a.email,
+    email: a.email,
+    size: 22
+  }), a.name || a.email, /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    title: "Don't Cc " + a.email,
+    "aria-label": "Remove " + a.email,
+    onClick: () => setDropCc(dropCc.concat([a.email])),
+    className: "w-5 h-5 grid place-items-center rounded-full text-muted hover:bg-ink/[0.08] hover:text-ink"
+  }, "\u00d7"))), /*#__PURE__*/React.createElement("input", {
     list: "fu-contacts",
-    className: "h-7 flex-1 bg-transparent text-[13px] border-b " + (badAddr(extraCc) ? 'border-[#c5221f]' : 'border-transparent focus:border-blueprint'),
+    className: "h-7 min-w-[180px] flex-1 bg-transparent text-[13px] border-b " + (badAddr(extraCc) ? 'border-[#c5221f]' : 'border-transparent focus:border-blueprint'),
     placeholder: (first.project.ccEmail ? first.project.ccEmail + ' (from the project) · ' : '') + 'add Cc',
     value: extraCc,
     onChange: e => setExtraCc(e.target.value)
-  }), /*#__PURE__*/React.createElement("datalist", {
+  })), /*#__PURE__*/React.createElement("datalist", {
     id: "fu-contacts"
   }, (contacts || []).slice(0, 400).map(c => /*#__PURE__*/React.createElement("option", {
     key: c.email,
@@ -7608,7 +7705,8 @@ function FollowUpDialog({
       setSending(true);
       await onSend(rows, tpl, n => setDone(n), {
         to: extraTo,
-        cc: extraCc
+        cc: extraCc,
+        dropCc: dropCc
       });
       setSending(false);
       onClose();
